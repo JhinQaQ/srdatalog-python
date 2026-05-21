@@ -11,11 +11,11 @@ This took me a minute to wrap my head around. There is no daemon, no
 server, no REPL. "Running" the project is really two different things:
 
 1. **Python only**: import the DSL, build a `Program`, run the
-   compiler frontend (HIR/MIR), and optionally write generated C++
+  compiler frontend (HIR/MIR), and optionally write generated C++
    files to disk. No clang, no GPU, no CUDA needed. This is what I
    do 90% of the time when I'm just reading the codebase.
 2. **Full pipeline**: also compile those generated `.cpp` files with
-   clang + CUDA, load the resulting `.so` with ctypes, actually
+  clang + CUDA, load the resulting `.so` with ctypes, actually
    execute. Needs a real toolchain.
 
 I mostly stick to #1 while I'm still figuring things out.
@@ -34,7 +34,7 @@ For the full pipeline (which I haven't been doing much yet):
 - `libboost_container` (`apt install libboost-container-dev`).
 - Optional but recommended: `ccache` on PATH.
 - An NVIDIA GPU if you actually want to run the kernels, not just
-  compile them.
+compile them.
 
 ## Setup I did once
 
@@ -49,11 +49,11 @@ uv pip install -e .
 What each one does, as far as I can tell:
 
 - `uv sync --group dev` creates `.venv` and installs Python deps
-  + dev tools.
+  - dev tools.
 - `populate_vendor.py` downloads C++ headers (boost, highway, RMM,
-  spdlog) into `vendor/`. Only matters when you actually compile.
+spdlog) into `vendor/`. Only matters when you actually compile.
 - `uv pip install -e .` editable installs the package itself so
-  `import srdatalog` works from any cwd.
+`import srdatalog` works from any cwd.
 
 Sanity check:
 
@@ -62,7 +62,7 @@ uv run python -c "import srdatalog; print(srdatalog.__version__)"
 # expected: 0.1.0
 ```
 
-> Gotcha I hit: out of the box, `import srdatalog` fails with
+> small fix: out of the box, `import srdatalog` fails with
 > `ModuleNotFoundError: cffi`. The fix is to add `cffi>=1.15` to
 > `dependencies` in `pyproject.toml` (the FFI wrapper imports it but
 > v0.1.0 forgot to declare it). I already made that fix in my
@@ -112,14 +112,16 @@ uv run python examples/run_benchmark.py tc --data /path/to/folder_with_csvs
 The script prints per-phase timings, which is nice for seeing where
 time goes.
 
-## Environment variables I learned about
+## Environment variables
 
-| Variable | What it does |
-|---|---|
-| `SRDATALOG_JIT_NO_CCACHE=1` | Disable ccache even if installed. |
-| `SRDATALOG_JIT_NO_NINJA=1` | Fall back to ThreadPoolExecutor instead of ninja. |
-| `CXX` | Override which clang++ binary is used. |
-| `CUDA_HOME` | Override CUDA toolkit detection. |
+
+| Variable                    | What it does                                      |
+| --------------------------- | ------------------------------------------------- |
+| `SRDATALOG_JIT_NO_CCACHE=1` | Disable ccache even if installed.                 |
+| `SRDATALOG_JIT_NO_NINJA=1`  | Fall back to ThreadPoolExecutor instead of ninja. |
+| `CXX`                       | Override which clang++ binary is used.            |
+| `CUDA_HOME`                 | Override CUDA toolkit detection.                  |
+
 
 I haven't needed any of these yet but writing them down so I know
 they exist.
