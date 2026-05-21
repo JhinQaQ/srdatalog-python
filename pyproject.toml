@@ -24,7 +24,9 @@ classifiers = [
   "Topic :: Software Development :: Compilers",
   "Topic :: Database :: Database Engines/Servers",
 ]
-dependencies = []
+dependencies = [
+  "cffi>=1.15",
+]
 
 [project.optional-dependencies]
 dev = [
