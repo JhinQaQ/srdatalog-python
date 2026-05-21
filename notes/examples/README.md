@@ -1,30 +1,41 @@
-# Walkthrough Examples
+# My walkthrough scripts
 
-These small scripts go from "just inspect a `Program`" up to "emit C++
-files to disk." They are written for *understanding the codebase*, not
-for benchmarking. They all run on CPU-only Python (no clang, no CUDA
-needed) unless explicitly noted.
+Small Python files I wrote while learning the DSL. They go from
+"just inspect a Program" to "actually emit C++ files." All of them
+run on plain Python — no clang, no CUDA, no GPU.
 
-Run any of them with:
+Run any of them like:
 
 ```bash
 cd /home/jinyang/Code/srdatalog/0_1
 uv run python notes/examples/01_hello.py
 ```
 
-## Files
+## What each one is for
 
-| File | Feature |
+| File | What I'm trying to learn |
 |---|---|
-| `01_hello.py` | Minimum viable `Program` + how to inspect it |
-| `02_transitive_closure.py` | Recursion: the classic Datalog example |
-| `03_filters_and_constants.py` | `Filter(...)` and integer constants in atoms |
-| `04_negation.py` | `~Atom(...)` to express "and NOT" |
-| `05_multi_head_and_named.py` | `(A | B) <= body`, `.named(...)` |
-| `06_planning.py` | `.with_plan(var_order=...)` to guide the join planner |
-| `07_inspect_hir_mir.py` | Run `compile_to_hir` / `compile_to_mir` and look at the IRs |
-| `08_emit_cpp.py` | `build_project(...)` — write the C++/CUDA tree to disk |
+| `01_hello.py` | Smallest possible `Program`. Just to see the shape. |
+| `02_transitive_closure.py` | Recursion. The classic Datalog example. |
+| `03_filters_and_constants.py` | How filters and integer constants look. |
+| `04_negation.py` | `~Atom(...)` and why it adds another stratum. |
+| `05_multi_head_and_named.py` | Multi-head rules and naming. |
+| `06_planning.py` | Hinting the join planner with `var_order`. |
+| `07_inspect_hir_mir.py` | Calling `compile_to_hir` / `compile_to_mir` directly and looking at the IRs. |
+| `08_emit_cpp.py` | `build_project(...)` to actually write C++/CUDA files to `./build/jit/...`. |
 
-No GPU is needed for files 1–8. File 8 only **emits** the source; it does
-not compile. To actually compile and run, see `notes/01-running.md`
-(`examples/run_benchmark.py`).
+## My suggested order
+
+1. **Run 01 and 02 first.** Get a feel for what a `Program` looks like.
+2. **Run 07.** Looking at strata + MIR steps was the moment HIR/MIR
+   stopped being abstract for me.
+3. **Run 08, then open the generated files.** The directory it prints
+   has `main.cpp` and `jit_batch_0.cpp`. Reading those side-by-side
+   with the original rules in Python is the best way I've found to
+   understand what the codegen is actually doing.
+
+## Caveat
+
+These are written for understanding, not for benchmarking. The rules
+are small and the input is empty. To actually run with input data and
+GPU execution, use `examples/run_benchmark.py` instead.

@@ -1,293 +1,198 @@
-# How to Read This Project — Architecture and API
+# How I read this codebase
 
-These are personal notes for reading `srdatalog-python` without
-getting lost. Read `01-running.md` first if you have not set up
-the project yet.
+Notes on the structure of srdatalog-python as I'm figuring it out.
+Not authoritative — the real docs are in `../docs/`. This is just my
+mental map. I'll keep revising.
 
----
+## My one-line mental model
 
-## 1. One-sentence summary
+It's a compiler. The input is a Datalog-style program written in
+Python. The output is C++/CUDA source code that uses a bundled GPU
+runtime. Then clang+ninja turn that source into a `.so`, and Python
+loads it with ctypes and calls into it.
 
-`srdatalog-python` is a **compiler written in Python**. The input
-is a small **Datalog-style DSL** (relations + rules). The output
-is **C++/CUDA source code** that uses a bundled GPU Datalog runtime,
-compiled into a `.so` and called from Python via `ctypes`.
+So Python is the **frontend + driver**, not the engine.
 
-Python = compiler frontend + driver.
-Native code = the real engine.
+This was confusing to me at first because the name has "Python" in
+it. I kept expecting Python to do the evaluation. It doesn't —
+Python builds an AST, lowers it through two IRs, prints C++ to
+disk, asks clang to compile it, then opens the result and calls it.
 
----
-
-## 2. The pipeline
-
-The whole project is one linear pipeline:
+## The pipeline
 
 ```
 Python DSL  →  HIR  →  MIR  →  C++/CUDA source  →  .so  →  ctypes calls
-   (your        (analyzed     (step-by-step      (compiled
-    rules)       Datalog)      execution plan)    runtime)
+  (rules)      (analyzed     (step-by-step       (clang+ninja
+                Datalog)      execution plan)     build it)
 ```
 
-| Stage   | What it represents                                       | Where in code                                       |
-|---------|----------------------------------------------------------|-----------------------------------------------------|
-| DSL     | Your Python `Program` with rules                         | `src/srdatalog/dsl.py`                              |
-| HIR     | Stratified, semi-naive Datalog with join plans + indexes | `src/srdatalog/hir/`                                |
-| MIR     | Ordered execution steps (pipelines, fixpoints)           | `src/srdatalog/mir/`                                |
-| Emit    | Strings of generated C++/CUDA                            | `src/srdatalog/codegen/`, `src/srdatalog/codegen/jit/` |
-| Compile | ninja + clang++ producing a `.so`                        | `src/srdatalog/codegen/jit/compiler_ninja.py`       |
-| Load    | `ctypes.CDLL` + `extern "C"` shim                        | `src/srdatalog/codegen/jit/loader.py`               |
+| Stage | What it's for | Where it lives |
+|---|---|---|
+| DSL | Your rules, as Python objects | `src/srdatalog/dsl.py` |
+| HIR | Cleaned up + planned Datalog (strata, semi-naive, indexes) | `src/srdatalog/hir/` |
+| MIR | Imperative-ish step plan (pipelines, fixpoints) | `src/srdatalog/mir/` |
+| Emit | Print C++/CUDA source strings | `src/srdatalog/codegen/`, `codegen/jit/` |
+| Compile | Run ninja + clang to build the `.so` | `codegen/jit/compiler_ninja.py` |
+| Load | ctypes + extern "C" shim | `codegen/jit/loader.py` |
 
-Two helpful mental shortcuts:
-- **HIR = "what program (logic)"** — still relational, still Datalog-shaped.
-- **MIR = "how to execute it"** — closer to imperative code.
+The cheat I use when I'm confused about what a file is for: ask
+"which arrow is this?" Usually it's one of those six.
 
----
-
-## 3. Top-level folder map
+## Folder map I built for myself
 
 ```
 0_1/
-├── src/srdatalog/      # The library itself
-│   ├── dsl.py             # User-facing DSL (Var, Relation, Program, rules)
-│   ├── hir/               # DSL → HIR passes (stratify, plan, index)
+├── src/srdatalog/      # the library
+│   ├── dsl.py             # the DSL surface (Var, Relation, Program, rules)
+│   ├── hir/               # DSL → HIR passes
 │   ├── mir/               # HIR → MIR + MIR passes
 │   ├── codegen/           # MIR → C++/CUDA strings
-│   │   ├── jit/           # JIT-specific emitters + ninja driver + loader
+│   │   ├── jit/           # JIT-specific: cache, compiler, loader, runners
 │   │   ├── batchfile.py
 │   │   ├── helpers.py
 │   │   └── schema.py
-│   ├── runtime/           # Auto-detect CUDA, list include paths, vendor headers
-│   ├── pipeline.py        # `compile_program`: DSL → HIR → MIR → strings
-│   ├── build.py           # `build_project`: pipeline + write files to disk
-│   ├── ffi/               # cffi wrapper (used by the older non-JIT path)
-│   ├── srdatalog_program.py  # Older non-JIT entry point
-│   └── viz/               # Optional visualization helpers
-├── examples/           # 17 benchmarks + run_benchmark.py driver
-├── tests/              # pytest suite
-├── tools/              # nim_to_dsl.py and friends
-├── docs/               # Markdown docs (architecture, getting_started, ...)
+│   ├── runtime/           # detect CUDA, list include paths, vendor headers
+│   ├── pipeline.py        # compile_program: DSL → HIR → MIR → emit strings
+│   ├── build.py           # build_project: pipeline + write files to disk
+│   ├── ffi/               # cffi wrapper (older non-JIT path)
+│   ├── srdatalog_program.py  # older non-JIT entry point
+│   └── viz/               # optional visualization
+├── examples/           # 17 benchmarks + run_benchmark.py
+├── tests/              # pytest
+├── tools/              # nim_to_dsl.py + friends
+├── docs/               # official markdown docs
 ├── scripts/            # populate_vendor.py + build hooks
-└── docker/             # Self-contained CUDA + clang-20 image
+└── docker/             # CUDA + clang-20 image (haven't tried this)
 ```
 
----
+## Public API (what `from srdatalog import ...` gives you)
 
-## 4. Public API (what gets exported)
+I cross-referenced this with `src/srdatalog/__init__.py`. Grouped
+by what I think each thing is for:
 
-From `src/srdatalog/__init__.py`. These are the names you `from srdatalog import ...`:
+### Write the DSL
 
-### DSL surface
+| Name | What I use it for |
+|---|---|
+| `Var` | Logic variable: `x = Var("x")` |
+| `Relation` | A table: `Edge = Relation("Edge", 2)` |
+| `Program` | Wrap rules: `Program(rules=[...])` |
 
-| Name       | Purpose                                                      |
-|------------|--------------------------------------------------------------|
-| `Var`      | A logic variable, e.g. `x = Var("x")`                        |
-| `Relation` | A named table with arity, e.g. `Edge = Relation("Edge", 2)`  |
-| `Program`  | Top-level container: `Program(rules=[...])`                  |
+The DSL also gives you operators (no import needed): `<=` for
+"head ← body", `&` to AND body clauses, `~` for negation,
+`.named("X")`, `.with_plan(var_order=...)`, `Filter(...)`, `Const(...)`.
 
-Plus operators on those objects:
-- `Head(x, y) <= Body1(x, z) & Body2(z, y)` — builds a `Rule`
-- `~Atom(...)` — negation
-- `Filter((x,), "return x > 0;")` — inline C++ filter on variables
-- `.named("RuleName")`, `.with_plan(var_order=[...])` — rule annotations
+### Compile
 
-### Compile pipeline
+| Name | What I think it does |
+|---|---|
+| `compile_to_hir` | Program → HIR (stratify, plan, index) |
+| `compile_to_mir` | Program → MIR (step plan) |
+| `build_project` | Everything: lower + write `.cpp` files to disk |
 
-| Function           | Purpose                                           |
-|--------------------|---------------------------------------------------|
-| `compile_to_hir`   | DSL `Program` → HIR (stratified, planned)         |
-| `compile_to_mir`   | DSL `Program` → MIR (step plan)                   |
-| `build_project`    | One-shot: DSL → HIR → MIR → write `.cpp` tree     |
+### Build the .so
 
-### Code-emit building blocks (rarely needed directly)
+| Name | What I think it does |
+|---|---|
+| `CompilerConfig` | Bundle of include paths / flags / libs |
+| `compile_jit_project` | Run ninja+clang on the emitted `.cpp` tree |
+| `CompileResult` / `BuildResult` | Output objects with stdout/stderr/paths |
+| `compile_cpp`, `link_shared` | Lower-level building blocks |
 
-| Function                          | Purpose                                  |
-|-----------------------------------|------------------------------------------|
-| `gen_complete_runner`             | Emit `JitRunner_<rule>` C++ struct       |
-| `gen_step_body`                   | Emit one `step_N` body                   |
-| `gen_main_file_content`           | Compose `main.cpp`                       |
-| `gen_schema_definitions_for_batch`| Emit schema section for a batch file     |
-| `gen_db_type_alias_for_batch`     | Emit `using <Project>_DB_Blueprint = ...` |
-| `write_jit_project`               | Write the emitted strings to disk        |
+### Load + call
 
-### Compile / link (ninja + clang)
+| Name | What I think it does |
+|---|---|
+| `EntryPoint` | Says "this extern C symbol has this signature" |
+| `JitRuntime` | The loaded `CDLL` + your bound entry points |
+| `build_and_load` | One-shot: emit + compile + load |
 
-| Name                  | Purpose                                                  |
-|-----------------------|----------------------------------------------------------|
-| `CompilerConfig`      | Includes / defines / cxx_flags / link_flags / libs       |
-| `compile_cpp`         | Compile one `.cpp` → `.o`                                |
-| `link_shared`         | Link `.o` files into a `.so`                             |
-| `compile_jit_project` | One-shot: emit `build.ninja`, run ninja, return result   |
-| `CompileResult` / `BuildResult` | Result objects with stdout/stderr/paths        |
+### Runtime detection (separate import)
 
-### Load + call (ctypes)
+`from srdatalog.runtime import runtime_include_paths,
+cuda_include_paths, runtime_defines, cuda_compile_flags,
+cuda_link_flags, cuda_libs, find_cuda_root`.
 
-| Name                | Purpose                                                       |
-|---------------------|---------------------------------------------------------------|
-| `EntryPoint`        | `extern "C"` symbol descriptor (argtypes, restype)            |
-| `JitRuntime`        | Holds the loaded `CDLL` + bound entry points                  |
-| `build_and_load`    | One-shot: emit + compile + load + bind entry points           |
-| `gen_runtime_shim_template` | Helper for emitting custom shims                      |
+These tell `CompilerConfig` how to find CUDA, the runtime headers,
+the vendor headers.
 
-### Runtime detection (`from srdatalog.runtime import ...`)
+### The actual C ABI (lives in the compiled .so)
 
-| Function                | Purpose                                       |
-|-------------------------|-----------------------------------------------|
-| `runtime_include_paths` | Where bundled runtime + vendor headers live   |
-| `cuda_include_paths`    | Auto-detected CUDA include dirs               |
-| `runtime_defines`       | `-D...` macros the runtime expects            |
-| `cuda_compile_flags`    | `-x cuda --cuda-path=...` etc.                |
-| `cuda_link_flags`       | `-L...` etc.                                  |
-| `cuda_libs`             | `["cudart", "cuda", ...]`                     |
-| `find_cuda_root`        | Locate CUDA 12.x toolkit                      |
+This is *not* Python — these are the C symbols you call via
+ctypes after the `.so` is built. I keep needing to look these up:
 
-### Generated C ABI (the symbols you call from `ctypes`)
+| Symbol | Signature | What it does |
+|---|---|---|
+| `srdatalog_init` | `int()` | Init CUDA |
+| `srdatalog_load_csv` | `int(const char*, const char*)` | Load one relation from a CSV |
+| `srdatalog_load_all` | `int(const char*)` | Load every `input_file=` relation in a dir |
+| `srdatalog_run` | `int(uint64_t)` | Run the fixpoint (0 = unlimited) |
+| `srdatalog_size` | `uint64_t(const char*)` | Read back the row count of a relation |
+| `srdatalog_shutdown` | `int()` | Free host state |
 
-These are *not* Python — they live in the compiled `.so`:
+## My suggested reading path
 
-| Symbol               | Signature                                  | Meaning                                            |
-|----------------------|--------------------------------------------|----------------------------------------------------|
-| `srdatalog_init`     | `int()`                                    | `init_cuda()`                                      |
-| `srdatalog_load_csv` | `int(const char*, const char*)`            | Load one relation from a CSV file                  |
-| `srdatalog_load_all` | `int(const char*)`                         | Walk every `input_file` relation in one dir        |
-| `srdatalog_run`      | `int(uint64_t max_iters)`                  | Run the fixpoint; `0` = unlimited                  |
-| `srdatalog_size`     | `uint64_t(const char*)`                    | Read back the size of a relation                   |
-| `srdatalog_shutdown` | `int()`                                    | Free host state                                    |
+Order that worked for me:
 
----
+1. README quickstart in the project root. Just paste-and-stare.
+2. `examples/tc.py` — what a real program looks like.
+3. `src/srdatalog/dsl.py` — how `<=`, `&`, `~`, `Filter`, `Const`,
+   `.named`, `.with_plan` are implemented. The docstring at the top
+   is a great mini-tutorial.
+4. `src/srdatalog/pipeline.py` → the `compile_program` function.
+   It's the spine. It calls `compile_to_hir`, then `compile_to_mir`,
+   then each emitter in turn.
+5. `src/srdatalog/build.py` → `build_project` is just `compile_program`
+   + writing files to disk.
+6. `examples/run_benchmark.py` — full end-to-end: program → emit
+   → compile → load → run.
 
-## 5. Reading order (what to open first)
+Then to go deeper (haven't fully done this yet):
 
-A reasonable horizontal slice:
+- `hir/__init__.py` and the per-pass files (stratify, semi_naive,
+  plan, index, lower).
+- `mir/types.py`, `mir/commands.py`, `mir/passes.py`.
+- `codegen/jit/complete_runner.py` and `main_file.py` (this is where
+  C++ strings actually get printed).
+- `codegen/jit/compiler_ninja.py` for how the build is orchestrated.
 
-1. **`README.md` quickstart** — paste-able TC example.
-2. **`examples/tc.py`** — what a real program looks like.
-3. **`src/srdatalog/dsl.py`** — how `Var`, `Relation`, `<=`, `&`, `~`,
-   `Filter`, `.named`, `.with_plan` are implemented.
-4. **`src/srdatalog/pipeline.py`** — `compile_program` is the heart of
-   the compiler: it calls `compile_to_hir`, `compile_to_mir`, then
-   each emitter.
-5. **`src/srdatalog/build.py`** — `build_project` is the thin wrapper
-   that adds disk I/O on top of `compile_program`.
-6. **`examples/run_benchmark.py`** — end-to-end driver: program → emit
-   → ninja compile → ctypes load → run.
+## Concepts I had to look up
 
-Then, if you want to dig deeper:
+I don't have a database background, so I had to chase down what some
+of these mean. Quick notes for future-me:
 
-- **HIR passes**: `src/srdatalog/hir/__init__.py` + `hir/*.py`
-  (stratify, semi_naive, plan, index, lower, split).
-- **MIR types and passes**: `src/srdatalog/mir/types.py`, `mir/passes.py`,
-  `mir/commands.py`, `mir/runner.py`.
-- **C++ emitters**: `src/srdatalog/codegen/jit/complete_runner.py`,
-  `codegen/jit/main_file.py`, `codegen/jit/orchestrator_jit.py`,
-  `codegen/jit/pipeline.py`, `codegen/jit/kernel_functor.py`.
-- **Build orchestration**: `codegen/jit/compiler_ninja.py`,
-  `codegen/jit/compiler.py`, `codegen/jit/cache.py`.
-- **Loading**: `codegen/jit/loader.py`.
+- **Relation**: a named table with fixed arity. `Edge(x, y)` is a
+  table with two columns.
+- **Rule**: "for every binding where the body holds, add this tuple
+  to the head." So `Path(x, z) <= Path(x, y) & Edge(y, z)` is "if
+  there's already a path x→y and an edge y→z, then also a path x→z."
+- **Fixpoint**: keep applying the rules until nothing new is added.
+  Recursive rules need this.
+- **Stratification**: when negation is involved, you have to fully
+  finish computing one group of relations before another can use
+  their negation. HIR groups rules into "strata" so this happens
+  cleanly.
+- **Semi-naive evaluation**: instead of re-doing the full join every
+  iteration, you only join against the *new* tuples from the last
+  iteration. HIR generates "variants" of each recursive rule, one
+  per "delta position."
+- **JIT**: "just-in-time" — here it means "compile a specialized C++
+  program just for this Datalog program, the first time you run it."
+  Not interpretation at runtime.
+- **Bundled runtime**: the generated C++ doesn't stand alone, it
+  includes headers from `src/srdatalog/runtime/generalized_datalog/`
+  and from `vendor/` (boost, highway, RMM, spdlog). Those headers
+  are where the actual GPU data structures live.
 
----
+## What still confuses me
 
-## 6. Key concepts you will hit
+Honest list:
 
-### Relations and rules
+- I don't really know how to read the generated `jit_batch_N.cpp`
+  files yet. The runtime template machinery is heavy.
+- I haven't figured out when the planner picks each `index_type`.
+- I don't know what "work-stealing runner" means in this codebase.
+- I haven't run any benchmark on a non-empty CSV yet — would like
+  to see actual non-zero result sizes.
 
-A `Relation` is a named table with a fixed arity. A `Rule` says:
-"these new tuples should appear in the head relation when these
-body atoms are simultaneously true."
-
-```python
-(Path(x, z) <= Path(x, y) & Edge(y, z)).named("TCRec")
-```
-
-is the Datalog rule `Path(x, z) :- Path(x, y), Edge(y, z)`.
-
-### Stratification
-
-Rules with negation cannot be evaluated in one big loop. The HIR
-stage groups rules into **strata** so that each stratum can be
-evaluated to a fixpoint before the next one starts.
-
-### Semi-naive evaluation
-
-Instead of recomputing all rules over the full relation on every
-iteration, the engine tracks **deltas** (rows added in the last
-iteration) and only joins those against existing rows. The HIR
-emits one **variant** of each recursive rule per "delta position."
-
-### Join planning
-
-For each rule, HIR picks:
-- a **variable order** (the join order),
-- a **clause order** (which body atom to scan first),
-- an **access pattern** per body atom (which columns are bound vs free),
-- indexes on each relation that make those patterns cheap.
-
-`.with_plan(var_order=[...])` lets you override the planner.
-
-### Fixpoint
-
-Recursive rules keep firing until no new tuples appear. That outer
-loop is generated as a `FixpointPlan` in MIR and as a `while` loop
-in C++.
-
-### JIT
-
-"JIT" here means "compile this specific program just-in-time when
-the user asks to run it" — not "interpret Python at runtime." A
-fresh `.so` is built for each unique program shape and cached on
-disk.
-
-### Bundled runtime
-
-The generated C++ files don't stand alone — they `#include` headers
-from `src/srdatalog/runtime/generalized_datalog/` (this project's
-runtime) and from `vendor/` (Boost, Highway, RMM, spdlog). Those
-headers implement the actual GPU data structures, kernels, and
-fixpoint loop.
-
----
-
-## 7. Where examples come from
-
-The 17 files in `examples/` were **auto-generated** from upstream
-Nim sources by `tools/nim_to_dsl.py`. Each one defines:
-
-- A few `Relation(...)` declarations at module level.
-- A `build_<schema>_program()` function that returns a `Program`.
-
-`examples/run_benchmark.py` knows that convention and uses it to
-drive any of them end-to-end.
-
----
-
-## 8. Status — what works and what does not
-
-From `README.md`'s "Status & roadmap":
-
-Working:
-- DSL, HIR, MIR, JIT codegen.
-- 125 / 127 runner fixtures byte-match the upstream Nim reference.
-- ninja + ccache compile orchestrator.
-- ctypes loader with the 5–6 entry-point shim.
-- Relation pragmas: `input_file=`, `print_size=`, `index_type=`.
-- `dataset_const` resolution.
-- Nim → Python translator.
-- All 17 canonical benchmarks runnable via `examples/run_benchmark.py`.
-
-Not yet:
-- Work-stealing runner variant (blocks the last 2 runner fixtures).
-- Precompiled headers (PCH) — disabled due to a clang-20 ODR bug.
-- Pre-built native runtime — users still need clang-20 + CUDA 12 +
-  libboost_container locally.
-
----
-
-## 9. TL;DR for newcomers
-
-If you just want a working mental model:
-
-> You write Datalog-like rules in Python. The library lowers them
-> through two IRs (HIR, MIR), prints C++/CUDA source files that use
-> a bundled GPU runtime, compiles those with clang+ninja into a `.so`,
-> and lets you load and call it from Python with `ctypes`.
-
-Everything else is implementation detail of one of those six arrows.
+I'll add answers here as I get them.
