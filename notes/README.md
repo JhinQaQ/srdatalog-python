@@ -7,7 +7,10 @@ Read in this order if you're new new to this like me:
 1. `[01-running.md](01-running.md)` — how I installed it and what I ran.
 2. `[02-architecture.md](02-architecture.md)` — what I understand about
   how the code is organized + the public API.
-3. `[examples/](examples/)` — small Python scripts I wrote to play with
+3. `[03-running-benchmarks.md](03-running-benchmarks.md)` — what
+  happened when I ran the real Hugging Face benchmarks (TC,
+  Galen, Doop), gotchas I hit, and TODOs.
+4. `[examples/](examples/)` — small Python scripts I wrote to play with
   the DSL, from simplest to slightly less simple.
 
 One sentence explain the project:

@@ -206,3 +206,124 @@ files yet. The runtime template machinery is heavy.
 to see actual non-zero result sizes.
 
 I'll add answers here as I get them.
+
+## Answers from Yihao (the original developer)
+
+I asked the original developer about the items above. These are his
+answers, paraphrased, plus my own notes so I can re-read them later
+and still understand.
+
+### Q: When does the planner pick each `index_type`?
+
+Yihao's answer (paraphrased):
+
+> It's done in an ad-hoc but complicated way. The planner scans every
+> variable in a canonicalized order using the first atom of each body
+> clause (the exact canonicalization has varied across versions —
+> sometimes by appearance order of the variable, sometimes sorted).
+> If a logical variable has the most "joined counts", it picks that
+> variable first, then repeats until no variables are left, then moves
+> to the next clause and does the same thing. But there are a lot of
+> edge cases — let-bindings, conditions, and negated atoms are all
+> handled differently.
+>
+> The reality is: I tried several ways to pick a "not bad" order that
+> can also be canonicalized, so that when you test and tune you don't
+> hit non-determinism (which is what makes slog unusable). That
+> turned out to be very hard, so most of my queries end up using
+> **manually ordered index selection**.
+>
+> "Manually" means: when you write a rule, you pick the variable
+> order that makes sense to your intuition (based on your estimation —
+> we don't have a query planner estimator). Then index selection with
+> the customized order derives the correct index for each relation
+> needed to run that variable order.
+
+My notes for understanding this:
+
+- "Joined count" = how often a variable appears across body atoms.
+The planner uses that as a rough proxy for "this var is the join
+key — bind it first."
+- "Canonicalized order" matters because if the planner is
+non-deterministic, the same program could compile to a different
+plan on different runs, and benchmarks become noisy. He's trying
+to keep the planner deterministic even if not perfect.
+- The practical takeaway: **prefer to use `.with_plan(var_order=...)`
+in real benchmarks** so you control the index selection instead of
+relying on the heuristic.
+- This is why almost every `examples/*.py` benchmark includes
+`.with_plan(var_order=[...])` on important rules.
+
+### Q: What is the "work-stealing runner" variant?
+
+Yihao's answer:
+
+> Skip this. It's a test to show in paper. Work stealing in an old
+> paper is bad.
+
+My notes:
+
+- This was about the 2 out of 127 byte-match fixtures that don't
+match the Nim reference. They depend on a "work-stealing" runner
+variant.
+- It is essentially a research checkpoint, not something I need to
+care about as a user. I can ignore it.
+
+### Q: How do I run benchmarks with real data so result sizes aren't 0?
+
+Yihao's answer:
+
+> Use https://huggingface.co/datasets/ysun67/srdatalog-benchmark
+
+My notes:
+
+- I already downloaded this dataset and got it to work — see
+`notes/03-running-benchmarks.md` (or my own log) for the exact
+commands I used.
+- For `tc`, just point `--data` at any folder containing an
+`Arc.csv`, e.g. `data/sg/usroad_small/`.
+- For `doop`, point `--data` at one of the `data/doop/*/` folders
+and pass `--meta` with the JSON. Note the upstream
+`eclipse_interned/meta.json` was missing a few keys —
+I had to regenerate it from `str2num.json`.
+
+### Q: How do I read the generated `jit_batch_N.cpp` files?
+
+Yihao's answer:
+
+> I put a comment in the generated code showing where the C++ came
+> from in the MIR. For the template-heavy code, you usually need to
+> read it together with the C++ template functions in the
+> `generalized_datalog` folder.
+>
+> The templates come from the fact that all relations are different,
+> and a lot of details are pure compiler knowledge: the arity of the
+> relation, its column types, its data structure, the hardware, and
+> the CUDA kernel-launch arguments. C++ templates are what let us
+> simplify all of this so the codegen layer doesn't have to rewrite
+> a different C++ program for every relation shape.
+
+My notes for understanding this:
+
+- "Compiler knowledge" he means: things the Python compiler knows but
+that C++ would otherwise need a separate version per relation:
+arity (number of columns), column types, index layout, kernel
+launch shape.
+- Templates push that variation into the C++ type system instead of
+the codegen. So instead of emitting a custom `Path_join_Edge_kernel`
+for each rule, codegen emits something like
+`Join<PathLayout, EdgeLayout>::run(...)` and the C++ template
+machinery in `generalized_datalog/` figures out the concrete code.
+- The comments he mentions show up at the top of generated blocks in
+`jit_batch_N.cpp` — they pin a chunk of C++ back to its MIR step.
+The right way to read these files is:
+1. Find the comment that names a MIR step.
+2. Cross-reference that step in `mir/types.py` /
+`codegen/jit/orchestrator_jit.py`.
+3. For any template like `JitRunner<...>` or `Index<...>`, open the
+matching header under
+`src/srdatalog/runtime/generalized_datalog/` to see what the
+template actually does.
+- TL;DR: the generated `.cpp` files are not meant to be read by
+themselves. They are a *thin specialized layer* on top of the
+templates in the runtime folder.

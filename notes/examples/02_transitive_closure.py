@@ -43,6 +43,11 @@ def main() -> None:
     pragma_str = ", " + ", ".join(pragmas) if pragmas else ""
     print(f"  {r.name}({r.arity}{pragma_str})")
 
+  print("\n=== Rules ===")
+  for r in program.rules:
+    print(f"  {r.name}: heads={[a.rel for a in r.heads]} body={[c for c in r.body]}")
+
+
 
 if __name__ == "__main__":
   main()
