@@ -113,7 +113,7 @@ HeapAllocSuperType   : 48,045,930
 
 ---
 
-## Findings (the “gotchas”)
+## Findings 
 
 ### A. The final `=== Result sizes ===` block always shows 0
 
@@ -220,11 +220,6 @@ The lesson: before running a benchmark, open `examples/<benchmark>.py`
 and read the `input_file=...` lines. Then point `--data` at a folder
 whose CSV names match.
 
-### G. Disk planning
-
-Extracted dataset takes ~22G. After extracting plus building Doop
-cache, free space on this box dropped from 110G → 89G. Worth
-keeping an eye on if you build many benchmarks.
 
 ---
 
