@@ -5,6 +5,7 @@ I have some code in [../examples/09_ir_translation_walkthrough.py](../examples/0
 My current understanding is:
 
 required_indices[Rel]  = all physical index layouts needed to read/join Rel   within or across strata. 
+
 canonical_index[Rel]  = one chosen primary layout used to maintain Rel's NEW / DELTA / FULL    versions: insert, dedup, compute delta, merge.
 
 But I’m still confused about why the canonical index is chosen the way it is, and how non-canonical required indexes are maintained.
