@@ -1,13 +1,9 @@
 """09_ir_translation_walkthrough.py - translate small programs across IRs.
 
 What this shows:
-  - How to read one rule as Python DSL, Datalog text, HIR, and MIR.
-  - Where HIR adds planning information: strata, variants, access patterns.
-  - Where MIR becomes imperative: execute-pipeline, fixpoint-plan,
-    compute-delta-index, merge-index.
-
-Run from the project root:
-  python notes/examples/09_ir_translation_walkthrough.py
+  - Read one rule as Python DSL, Datalog text, HIR, and MIR.
+  - HIR adds planning information: strata, variants, access patterns.
+  - MIR: execute-pipeline, fixpoint-plan, compute-delta-index, merge-index.
 
 This file adds ./src to sys.path so it works from a fresh clone without
 installing the package first. It does not emit C++ and does not need CUDA.
@@ -76,13 +72,13 @@ def print_source_ir(program: Program, hand_datalog: str, hand_logical: str) -> N
   print(hand_datalog)
 
   small("IR 1: Python DSL objects")
-  print("The DSL is not executing the query. It builds Rule/Atom objects.")
+  print("The DSL builds Rule/Atom objects (not executing the query).")
   for rule in program.rules:
     heads = " | ".join(atom_text(head) for head in rule.heads)
     body = ", ".join(clause_text(clause) for clause in rule.body)
     print(f"  {rule.name}: {heads} <= {body}")
 
-  small("IR 1.5: logical operator view, handwritten")
+  small("IR 1.5: logical operator, handwritten")
   print(hand_logical)
 
 
