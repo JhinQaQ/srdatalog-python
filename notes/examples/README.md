@@ -23,16 +23,7 @@ uv run python notes/examples/01_hello.py
 | `06_planning.py` | Hinting the join planner with `var_order`. |
 | `07_inspect_hir_mir.py` | Calling `compile_to_hir` / `compile_to_mir` directly and looking at the IRs. |
 | `08_emit_cpp.py` | `build_project(...)` to actually write C++/CUDA files to `./build/jit/...`. |
-
-## My suggested order
-
-1. **Run 01 and 02 first.** Get a feel for what a `Program` looks like.
-2. **Run 07.** Looking at strata + MIR steps was the moment HIR/MIR
-   stopped being abstract for me.
-3. **Run 08, then open the generated files.** The directory it prints
-   has `main.cpp` and `jit_batch_0.cpp`. Reading those side-by-side
-   with the original rules in Python is the best way I've found to
-   understand what the codegen is actually doing.
+| `09_ir_translation_walkthrough.py` | Hand-written translations from Datalog/DSL to HIR/MIR for two-hop, TC, and negation. |
 
 ## Caveat
 
