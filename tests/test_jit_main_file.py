@@ -22,6 +22,7 @@ from srdatalog.codegen.batchfile import _collect_pipelines
 from srdatalog.codegen.jit.complete_runner import gen_complete_runner
 from srdatalog.codegen.jit.main_file import (
   _extract_computed_relations,
+  gen_extern_c_shim,
   gen_main_file_content,
   gen_relation_typedefs,
   gen_runner_struct,
@@ -147,6 +148,87 @@ def test_main_file_content_triangle_assembly():
   assert "struct TrianglePlan_Runner {" in out
   # JIT summary footer
   assert "JIT kernels in 1 batch files" in out
+
+
+def test_gpu_mem_logging_codegen_is_opt_in():
+  from test_integration_triangle import build_triangle
+
+  prog = build_triangle()
+  hir = compile_to_hir(prog)
+  mir = compile_to_mir(prog)
+  step_bodies = [
+    gen_step_body(step, "TrianglePlan_DB_DeviceDB", is_rec, i)
+    for i, (step, is_rec) in enumerate(mir.steps)
+  ]
+  runner_decls: dict[str, str] = {}
+  for ep in _collect_pipelines(mir):
+    decl, _full = gen_complete_runner(ep, "TrianglePlan_DB_DeviceDB")
+    runner_decls[ep.rule_name] = decl
+
+  default_out = gen_main_file_content(
+    "TrianglePlan",
+    hir.relation_decls,
+    mir,
+    step_bodies,
+    runner_decls,
+  )
+  logged_out = gen_main_file_content(
+    "TrianglePlan",
+    hir.relation_decls,
+    mir,
+    step_bodies,
+    runner_decls,
+    gpu_mem_log=True,
+  )
+  detail_out = gen_main_file_content(
+    "TrianglePlan",
+    hir.relation_decls,
+    mir,
+    step_bodies,
+    runner_decls,
+    gpu_mem_log_detail=True,
+  )
+  shim = gen_extern_c_shim(
+    "TrianglePlan",
+    hir.relation_decls,
+    gpu_mem_log=True,
+    canonical_indices={"TRel": [1, 0]},
+  )
+
+  assert "gpu/runtime/memory_logging.h" not in default_out
+  assert "log_gpu_memory" not in default_out
+  assert '#include "gpu/runtime/memory_logging.h"' in logged_out
+  assert 'SRDatalog::GPU::log_gpu_memory("before step 0");' in logged_out
+  assert '#include "gpu/runtime/memory_logging.h"' in detail_out
+  assert "SRDatalog::GPU::log_gpu_memory_detail" in detail_out
+  assert 'before step 0 create_index ZRel.NEW[0,1,2]' in detail_out
+  assert 'SRDatalog::GPU::log_gpu_memory("after copy_host_to_device");' in shim
+  assert "static std::unique_ptr<TrianglePlan_DB_Blueprint_DeviceDB> g_device_db;" in shim
+  assert (
+    "g_device_db = std::make_unique<TrianglePlan_DB_Blueprint_DeviceDB>(std::move(device_db));"
+    in shim
+  )
+  assert "auto& rel = get_relation_by_schema<TRel, FULL_VER>(*g_device_db);" in shim
+  assert "SRDatalog::IndexSpec idx{1, 0};" in shim
+  assert "if (!rel.has_index(idx)) rel.ensure_index(idx);" in shim
+  assert "g_device_db.reset();" in shim
+
+
+def test_evict_index_codegen_shape():
+  import srdatalog.mir.types as mir
+  from srdatalog.hir.types import Version
+
+  step = mir.EvictIndex(rel_name="Path", version=Version.FULL, index=[1, 0])
+
+  out = gen_step_body(step, "TrianglePlan_DB_DeviceDB", False, 3)
+
+  assert "static void step_3" in out
+  assert "GPU_DEVICE_SYNCHRONIZE();" in out
+  assert (
+    "SRDatalog::GPU::mir_helpers::evict_index_fn<"
+    "SRDatalog::mir::IndexSpecT<Path, std::integer_sequence<int, 1, 0>, FULL_VER>>(db, 3);"
+    in out
+  )
 
 
 # -----------------------------------------------------------------------------

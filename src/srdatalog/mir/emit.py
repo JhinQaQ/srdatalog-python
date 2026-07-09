@@ -289,6 +289,17 @@ def print_mir_sexpr(node: m.MirNode, indent: int = 0) -> str:
       + ")"
     )
 
+  if isinstance(node, m.EvictIndex):
+    return (
+      p
+      + "(evict-index"
+      + " #:index "
+      + _index(node.rel_name, node.index)
+      + " #:ver "
+      + _ver(node.version)
+      + ")"
+    )
+
   if isinstance(node, m.ClearRelation):
     return p + "(clear-relation" + " :schema " + node.rel_name + " :ver " + _ver(node.version) + ")"
 

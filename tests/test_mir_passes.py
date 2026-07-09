@@ -11,6 +11,7 @@ from srdatalog.mir.passes import (
   apply_all_mir_passes,
   apply_clause_order_reordering,
   apply_prefix_source_reordering,
+  insert_dead_index_evictions,
   insert_pre_reconstruct_rebuilds,
 )
 
@@ -290,6 +291,79 @@ def test_balanced_scan_pass_noop_when_no_balanced_scan():
   assert ep.pipeline == [scan, ins]
 
 
+# -----------------------------------------------------------------------------
+# Pass 4: insert_dead_index_evictions
+# -----------------------------------------------------------------------------
+
+
+def _read_step(
+  rel_name: str,
+  index: list[int],
+  version: Version = Version.FULL,
+) -> tuple[mir.ExecutePipeline, bool]:
+  src = mir.ColumnSource(rel_name=rel_name, version=version, index=index)
+  ep = mir.ExecutePipeline(
+    pipeline=[src],
+    source_specs=[src],
+    dest_specs=[],
+    rule_name=f"Read{rel_name}",
+  )
+  return (ep, False)
+
+
+def _evictions(steps: list[tuple[mir.MirNode, bool]]) -> list[mir.EvictIndex]:
+  return [node for node, _ in steps if isinstance(node, mir.EvictIndex)]
+
+
+def test_dead_index_eviction_inserts_after_last_full_use():
+  out = insert_dead_index_evictions([_read_step("R", [0, 1])])
+
+  assert len(out) == 2
+  evict = out[1][0]
+  assert isinstance(evict, mir.EvictIndex)
+  assert evict.rel_name == "R"
+  assert evict.version is Version.FULL
+  assert evict.index == [0, 1]
+
+
+def test_dead_index_eviction_waits_until_later_use_finishes():
+  steps = [_read_step("R", [0, 1]), _read_step("R", [0, 1])]
+
+  out = insert_dead_index_evictions(steps)
+
+  assert isinstance(out[0][0], mir.ExecutePipeline)
+  assert isinstance(out[1][0], mir.ExecutePipeline)
+  assert isinstance(out[2][0], mir.EvictIndex)
+  assert out[2][0].index == [0, 1]
+
+
+def test_dead_index_eviction_never_emits_new_or_delta_evictions():
+  steps = [
+    (
+      mir.FixpointPlan(
+        instructions=[
+          mir.RebuildIndex(rel_name="R", version=Version.NEW, index=[0]),
+          mir.RebuildIndex(rel_name="R", version=Version.DELTA, index=[0]),
+        ]
+      ),
+      False,
+    ),
+    _read_step("S", [0], version=Version.DELTA),
+  ]
+
+  out = insert_dead_index_evictions(steps)
+
+  assert _evictions(out)
+  assert all(evict.version is Version.FULL for evict in _evictions(out))
+  assert all(evict.rel_name != "R" for evict in _evictions(out))
+
+
+def test_dead_index_eviction_skips_protected_relations():
+  out = insert_dead_index_evictions([_read_step("R", [0, 1])], protected_rels={"R"})
+
+  assert _evictions(out) == []
+
+
 if __name__ == "__main__":
   tests = [
     test_pre_reconstruct_noop_when_needed_subset_of_merged,
@@ -304,6 +378,10 @@ if __name__ == "__main__":
     test_balanced_scan_pass_converts_column_join_to_positioned_extract,
     test_balanced_scan_pass_leaves_non_balanced_var_alone,
     test_balanced_scan_pass_noop_when_no_balanced_scan,
+    test_dead_index_eviction_inserts_after_last_full_use,
+    test_dead_index_eviction_waits_until_later_use_finishes,
+    test_dead_index_eviction_never_emits_new_or_delta_evictions,
+    test_dead_index_eviction_skips_protected_relations,
   ]
   for t in tests:
     t()

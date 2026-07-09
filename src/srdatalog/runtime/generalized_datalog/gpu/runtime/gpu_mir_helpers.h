@@ -16,8 +16,31 @@
 #include "gpu/index_ops.h"
 #include "gpu_fixpoint_executor_common.h"
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 
 namespace SRDatalog::GPU::mir_helpers {
+
+inline bool evict_log_enabled() {
+  const char* value = std::getenv("SRDATALOG_GPU_EVICT_LOG");
+  return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0 &&
+         std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
+         std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
+}
+
+inline const char* version_name(std::size_t ver) {
+  if (ver == FULL_VER) {
+    return "FULL";
+  }
+  if (ver == DELTA_VER) {
+    return "DELTA";
+  }
+  if (ver == NEW_VER) {
+    return "NEW";
+  }
+  return "UNKNOWN";
+}
 
 // ============================================================================
 // compute_delta_fn - Extracted from executor_compute_delta.h
@@ -229,6 +252,57 @@ bool rebuild_index_fn(DB& db) {
   nvtxRangePop();
 
   return new_tuples;
+}
+
+// ============================================================================
+// evict_index_fn - Explicitly drop a physical index layout
+// ============================================================================
+
+/**
+ * @brief Evict one physical index object from a relation.
+ *
+ * @details The relation keeps the index specification registered. A later
+ *          ensure_index() call can recreate the physical layout if the compiler
+ *          schedule needs it again.
+ *
+ * @tparam IndexSpecT The index spec to evict
+ * @tparam DB The database type
+ * @param db The database reference
+ * @return true if an index object was erased
+ */
+template <typename IndexSpecT, typename DB>
+bool evict_index_fn(DB& db, int step = -1) {
+  using Schema = typename IndexSpecT::schema_type;
+  using ColSeq = typename IndexSpecT::column_indexes_type;
+  constexpr std::size_t ver = IndexSpecT::kVersion;
+
+  auto& rel = get_relation_by_schema<Schema, ver>(db);
+  auto runtime_spec = []<typename T, T... Cols>(std::integer_sequence<T, Cols...>) {
+    return SRDatalog::IndexSpec{{static_cast<int>(Cols)...}};
+  }(ColSeq{});
+
+  const bool existed = rel.has_index(runtime_spec);
+  std::size_t index_size = 0;
+  std::size_t index_bytes = 0;
+  if (existed) {
+    auto& idx = rel.get_index(runtime_spec);
+    index_size = idx.size();
+    if constexpr (requires { idx.bytes_used(); }) {
+      index_bytes = idx.bytes_used();
+    }
+  }
+  const std::size_t relation_size = rel.size();
+  const bool evicted = rel.evict_index(runtime_spec);
+
+  if (evict_log_enabled()) {
+    std::cout << "[evict-index] step=" << step << " rel=" << rel.name()
+              << " ver=" << version_name(ver)
+              << " index=" << runtime_spec.to_string() << " existed=" << (existed ? 1 : 0)
+              << " evicted=" << (evicted ? 1 : 0) << " index_size=" << index_size
+              << " index_bytes=" << index_bytes << " relation_size=" << relation_size
+              << std::endl;
+  }
+  return evicted;
 }
 
 // ============================================================================

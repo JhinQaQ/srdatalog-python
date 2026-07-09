@@ -1114,6 +1114,13 @@ class Relation {
     return indexes_.find(spec) != indexes_.end();
   }
 
+  // Drop the physical index object for this spec while keeping the registered
+  // spec list intact. A later ensure_index(spec) can rebuild it from relation
+  // storage if needed.
+  bool evict_index(const IndexSpec& spec) {
+    return indexes_.erase(spec) > 0;
+  }
+
   // check if a index is dirty
   [[nodiscard]] bool is_dirty(const IndexSpec& spec) const {
     // Check if index exists first

@@ -201,19 +201,162 @@ def gen_kernel_decls_block(
   return out
 
 
-def gen_load_data_method(decls: list[RelationDecl]) -> str:
+def gen_load_data_method(decls: list[RelationDecl], *, amplified_loader: bool = False) -> str:
   '''Emit the `load_data` static template method — reads CSVs for
   every relation with `input_file` set.'''
   out = "  template <typename DB>\n"
   out += "  static void load_data(DB& db, std::string root_dir) {\n"
   for d in decls:
     if d.input_file:
-      out += f'    SRDatalog::load_from_file<{d.rel_name}>(db, root_dir + "/{d.input_file}");\n'
+      loader = "load_from_file_env_amplified" if amplified_loader else "load_from_file"
+      out += f'    SRDatalog::{loader}<{d.rel_name}>(db, root_dir + "/{d.input_file}");\n'
   out += "  }\n\n"
   return out
 
 
-def _gen_run_body_per_step(step_idx: int, step: m.MirNode, is_recursive: bool) -> str:
+def _gen_gpu_mem_log(label: str, indent: str = "    ") -> str:
+  return f'{indent}SRDatalog::GPU::log_gpu_memory("{label}");\n'
+
+
+def _gen_gpu_mem_detail_log(step_idx: int, label: str, indent: str) -> str:
+  return f'{indent}SRDatalog::GPU::log_gpu_memory_detail({step_idx}, "{label}");\n'
+
+
+def _gen_gpu_mem_include(gpu_mem_log: bool) -> str:
+  return '#include "gpu/runtime/memory_logging.h"\n' if gpu_mem_log else ""
+
+
+def _cpp_string_escape(value: str) -> str:
+  return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _index_spec_relation(line: str) -> str | None:
+  marker = "IndexSpecT<"
+  if marker not in line:
+    return None
+  tail = line.split(marker, 1)[1]
+  return tail.split(",", 1)[0].strip()
+
+
+def _index_spec_order(line: str) -> str:
+  marker = "std::integer_sequence<int,"
+  if marker not in line:
+    return ""
+  tail = line.split(marker, 1)[1].split(">", 1)[0]
+  cols = ",".join(part.strip() for part in tail.split(",") if part.strip())
+  return f"[{cols}]" if cols else ""
+
+
+def _template_relation(line: str, marker: str) -> str | None:
+  if marker not in line:
+    return None
+  tail = line.split(marker, 1)[1]
+  return tail.split(",", 1)[0].split(">", 1)[0].strip()
+
+
+def _version_tag(line: str) -> str:
+  for tag in ("NEW_VER", "DELTA_VER", "FULL_VER"):
+    if tag in line:
+      return tag.removesuffix("_VER")
+  return "?"
+
+
+def _runner_name(line: str) -> str | None:
+  if "JitRunner_" not in line or "::" not in line:
+    return None
+  tail = line.split("JitRunner_", 1)[1]
+  return "JitRunner_" + tail.split("::", 1)[0]
+
+
+def _gpu_mem_detail_label_for_line(step_idx: int, line: str) -> str | None:
+  stripped = line.strip()
+  if not stripped or stripped.startswith("//"):
+    return None
+  if "log_gpu_memory" in stripped:
+    return None
+
+  rel = _index_spec_relation(stripped)
+  spec = _index_spec_order(stripped)
+  if "create_index_fn<" in stripped and rel:
+    return f"step {step_idx} create_index {rel}.{_version_tag(stripped)}{spec}"
+  if "create_flat_view_fn<" in stripped and rel:
+    return f"step {step_idx} create_flat_view {rel}.{_version_tag(stripped)}{spec}"
+  if "rebuild_index_from_index_fn<" in stripped and rel:
+    return f"step {step_idx} rebuild_index_from {rel}.{_version_tag(stripped)}{spec}"
+  if "rebuild_index_fn<" in stripped and rel:
+    return f"step {step_idx} rebuild_index {rel}.{_version_tag(stripped)}{spec}"
+  if "evict_index_fn<" in stripped and rel:
+    return f"step {step_idx} evict_index {rel}.{_version_tag(stripped)}{spec}"
+  if "compute_delta_index_fn<" in stripped and rel:
+    return f"step {step_idx} compute_delta {rel}{spec}"
+  if "merge_index_fn<" in stripped and rel:
+    return f"step {step_idx} merge_index {rel}.{_version_tag(stripped)}{spec}"
+  if "reconstruct_fn<" in stripped and rel:
+    return f"step {step_idx} reconstruct {rel}.{_version_tag(stripped)}{spec}"
+
+  rel = _template_relation(stripped, "clear_relation_fn<")
+  if rel:
+    return f"step {step_idx} clear_relation {rel}.{_version_tag(stripped)}"
+  rel = _template_relation(stripped, "check_size_fn<")
+  if rel:
+    return f"step {step_idx} check_size {rel}"
+
+  runner = _runner_name(stripped)
+  if runner:
+    for op in (
+      "setup",
+      "launch_count",
+      "launch_materialize",
+      "execute_fused",
+      "execute",
+      "launch_fused",
+      "scan_and_resize",
+      "scan_only",
+      "read_total",
+    ):
+      if f"::{op}" in stripped:
+        return f"step {step_idx} {op} {runner}"
+
+  if "DeviceArray<" in stripped:
+    return f"step {step_idx} allocate_device_array"
+  if "resize_interned_columns" in stripped:
+    rel = None
+    if "dest_" in stripped:
+      rel = stripped.split("dest_", 1)[1].split(".", 1)[0].split(" ", 1)[0]
+    suffix = f" {rel}" if rel else ""
+    return f"step {step_idx} resize_interned_columns{suffix}"
+  if "thrust::exclusive_scan" in stripped:
+    return f"step {step_idx} exclusive_scan"
+  if "_stream_pool.sync_all" in stripped:
+    return f"step {step_idx} stream_pool_sync_all"
+  if "GPU_DEVICE_SYNCHRONIZE()" in stripped:
+    return f"step {step_idx} device_synchronize"
+
+  return None
+
+
+def _instrument_step_body_gpu_mem_detail(body: str, step_idx: int) -> str:
+  out: list[str] = []
+  for line in body.splitlines(keepends=True):
+    label = _gpu_mem_detail_label_for_line(step_idx, line)
+    if label is None:
+      out.append(line)
+      continue
+    indent = line[: len(line) - len(line.lstrip())]
+    escaped = _cpp_string_escape(label)
+    out.append(_gen_gpu_mem_detail_log(step_idx, f"before {escaped}", indent))
+    out.append(line)
+    out.append(_gen_gpu_mem_detail_log(step_idx, f"after {escaped}", indent))
+  return "".join(out)
+
+
+def _gen_run_body_per_step(
+  step_idx: int,
+  step: m.MirNode,
+  is_recursive: bool,
+  *,
+  gpu_mem_log: bool = False,
+) -> str:
   '''Per-step timing-instrumented call from run(). Matches Nim
   codegen.nim:423-439.'''
   s = str(step_idx)
@@ -221,7 +364,11 @@ def _gen_run_body_per_step(step_idx: int, step: m.MirNode, is_recursive: bool) -
   step_type = "recursive" if is_recursive else "simple"
 
   out = f"    auto step_{s}_start = std::chrono::high_resolution_clock::now();\n"
+  if gpu_mem_log:
+    out += _gen_gpu_mem_log(f"before step {s}")
   out += f"    step_{s}(db, max_iterations);\n"
+  if gpu_mem_log:
+    out += _gen_gpu_mem_log(f"after step {s}")
   out += f"    auto step_{s}_end = std::chrono::high_resolution_clock::now();\n"
   out += (
     f"    auto step_{s}_duration = "
@@ -238,6 +385,8 @@ def _gen_run_body_per_step(step_idx: int, step: m.MirNode, is_recursive: bool) -
 def _gen_final_print_block(
   decls: list[RelationDecl],
   canonical_indices: dict[str, list[int]] | None,
+  *,
+  ensure_indexes: bool = False,
 ) -> str:
   '''Final `print_size` block — emits size reads for every relation
   tagged `print_size=True`. Uses canonical index when available;
@@ -257,6 +406,8 @@ def _gen_final_print_block(
     out += "    {\n"
     out += f"      SRDatalog::IndexSpec canonical_idx{{{cols_str}}};\n"
     out += f"      auto& rel = get_relation_by_schema<{d.rel_name}, FULL_VER>(db);\n"
+    if ensure_indexes:
+      out += "      rel.ensure_index(canonical_idx);\n"
     out += "      if (rel.has_index(canonical_idx)) {\n"
     out += "        auto& idx = rel.get_index(canonical_idx);\n"
     out += (
@@ -278,6 +429,10 @@ def gen_runner_struct(
   mir_program: m.Program,
   step_bodies: list[str],
   canonical_indices: dict[str, list[int]] | None = None,
+  gpu_mem_log: bool = False,
+  gpu_mem_log_detail: bool = False,
+  amplified_loader: bool = False,
+  ensure_print_indexes: bool = False,
 ) -> str:
   '''Emit `<Ruleset>_Runner` — the main orchestrator struct.
 
@@ -294,10 +449,12 @@ def gen_runner_struct(
 
   out = f"struct {ruleset_name}_Runner {{\n"
   out += f"  using DB = {ruleset_name}_DB;\n\n"
-  out += gen_load_data_method(decls)
+  out += gen_load_data_method(decls, amplified_loader=amplified_loader)
 
   # Step bodies — each is a full `template <typename DB> static void step_N(...)`.
-  for body in step_bodies:
+  for i, body in enumerate(step_bodies):
+    if gpu_mem_log_detail:
+      body = _instrument_step_body_gpu_mem_detail(body, i)
     out += body
 
   # run() method.
@@ -306,8 +463,12 @@ def gen_runner_struct(
     "  static void run(DB& db, std::size_t max_iterations = std::numeric_limits<int>::max()) {\n"
   )
   for i, (step, is_rec) in enumerate(mir_program.steps):
-    out += _gen_run_body_per_step(i, step, is_rec)
-  out += _gen_final_print_block(decls, canonical_indices)
+    out += _gen_run_body_per_step(i, step, is_rec, gpu_mem_log=gpu_mem_log)
+  out += _gen_final_print_block(
+    decls,
+    canonical_indices,
+    ensure_indexes=ensure_print_indexes,
+  )
   out += "  }\n"
   out += "};\n"
   return out
@@ -333,6 +494,8 @@ def gen_runner_struct_declonly(
   ruleset_name: str,
   decls: list[RelationDecl],
   mir_program: m.Program,
+  *,
+  amplified_loader: bool = False,
 ) -> str:
   '''Non-template Runner struct DECLARATION (for main.cpp).
 
@@ -343,7 +506,9 @@ def gen_runner_struct_declonly(
   device_db = f"{ruleset_name}_DB_DeviceDB"
   out = f"struct {ruleset_name}_Runner {{\n"
   out += f"  using DB = {device_db};\n\n"
-  out += gen_load_data_method(decls)  # load_data stays a template — cheap
+  out += gen_load_data_method(
+    decls, amplified_loader=amplified_loader
+  )  # load_data stays a template — cheap
   for i in range(len(mir_program.steps)):
     out += f"  static void step_{i}(DB& db, std::size_t max_iterations);\n"
   out += (
@@ -389,6 +554,9 @@ def _shared_runner_preamble(
   decls: list[RelationDecl],
   runner_decls: dict[str, str],
   extra_index_headers: list[str] | None = None,
+  gpu_mem_log: bool = False,
+  gpu_mem_log_detail: bool = False,
+  amplified_loader: bool = False,
 ) -> str:
   '''Preamble shared by every out-of-line shard: srdatalog.h, plugin
   headers, inline schemas + DB alias, GPU runtime includes, JitRunner
@@ -406,6 +574,7 @@ def _shared_runner_preamble(
   out += '#include "gpu/runtime/jit/materialized_join.h"\n'
   out += '#include "gpu/runtime/jit/ws_infrastructure.h"\n'
   out += '#include "gpu/runtime/stream_pool.h"\n'
+  out += _gen_gpu_mem_include(gpu_mem_log or gpu_mem_log_detail)
   out += "using namespace SRDatalog::GPU;\n\n"
   for h in extra_index_headers or []:
     out += f'#include "{h}"\n'
@@ -424,7 +593,7 @@ def _shared_runner_preamble(
   # `gen_load_data_method` template body, not just a forward decl.
   out += f"struct {ruleset_name}_Runner {{\n"
   out += f"  using DB = {ruleset_name}_DB_DeviceDB;\n\n"
-  out += gen_load_data_method(decls)
+  out += gen_load_data_method(decls, amplified_loader=amplified_loader)
   # step_N + run decls are appended by the caller (we don't know step
   # count here).
   return out
@@ -438,6 +607,8 @@ def gen_step_shard_file(
   step_bodies: list[str],
   step_idx: int,
   extra_index_headers: list[str] | None = None,
+  amplified_loader: bool = False,
+  gpu_mem_log_detail: bool = False,
 ) -> str:
   '''Emit a standalone .cpp for one step_N out-of-line definition.
 
@@ -447,7 +618,14 @@ def gen_step_shard_file(
   instead of serializing through main.cpp.
   '''
   device_db = f"{ruleset_name}_DB_DeviceDB"
-  pre = _shared_runner_preamble(ruleset_name, decls, runner_decls, extra_index_headers)
+  pre = _shared_runner_preamble(
+    ruleset_name,
+    decls,
+    runner_decls,
+    extra_index_headers,
+    gpu_mem_log_detail=gpu_mem_log_detail,
+    amplified_loader=amplified_loader,
+  )
   # Complete the Runner struct declaration with all step_N + run sigs.
   for i in range(len(mir_program.steps)):
     pre += f"  static void step_{i}(DB& db, std::size_t max_iterations);\n"
@@ -457,7 +635,9 @@ def gen_step_shard_file(
   pre += "};\n\n"
 
   body_oop = _step_body_template_to_oop(
-    step_bodies[step_idx],
+    _instrument_step_body_gpu_mem_detail(step_bodies[step_idx], step_idx)
+    if gpu_mem_log_detail
+    else step_bodies[step_idx],
     ruleset_name,
     step_idx,
     device_db,
@@ -472,12 +652,23 @@ def gen_run_dispatcher_file(
   mir_program: m.Program,
   canonical_indices: dict[str, list[int]] | None = None,
   extra_index_headers: list[str] | None = None,
+  gpu_mem_log: bool = False,
+  amplified_loader: bool = False,
+  ensure_print_indexes: bool = False,
 ) -> str:
   '''Emit the Runner::run() out-of-line definition in its own TU.
   Contains the step_0..step_N dispatch + print_size block.
   '''
   device_db = f"{ruleset_name}_DB_DeviceDB"
-  pre = _shared_runner_preamble(ruleset_name, decls, runner_decls, extra_index_headers)
+  pre = _shared_runner_preamble(
+    ruleset_name,
+    decls,
+    runner_decls,
+    extra_index_headers,
+    gpu_mem_log,
+    False,
+    amplified_loader,
+  )
   for i in range(len(mir_program.steps)):
     pre += f"  static void step_{i}(DB& db, std::size_t max_iterations);\n"
   pre += (
@@ -486,8 +677,12 @@ def gen_run_dispatcher_file(
   pre += "};\n\n"
   body = f"void {ruleset_name}_Runner::run({device_db}& db, std::size_t max_iterations) {{\n"
   for i, (step, is_rec) in enumerate(mir_program.steps):
-    body += _gen_run_body_per_step(i, step, is_rec)
-  body += _gen_final_print_block(decls, canonical_indices)
+    body += _gen_run_body_per_step(i, step, is_rec, gpu_mem_log=gpu_mem_log)
+  body += _gen_final_print_block(
+    decls,
+    canonical_indices,
+    ensure_indexes=ensure_print_indexes,
+  )
   body += "}\n"
   return pre + body
 
@@ -521,6 +716,10 @@ def gen_main_file_content(
   emit_preamble: bool = False,
   extra_index_headers: list[str] | None = None,
   decl_only_runner: bool = False,
+  gpu_mem_log: bool = False,
+  gpu_mem_log_detail: bool = False,
+  amplified_loader: bool = False,
+  ensure_print_indexes: bool = False,
 ) -> str:
   '''Emit the full main-file string — mirrors Nim's `mir_cpp_str`.
 
@@ -555,11 +754,17 @@ def gen_main_file_content(
     cache_dir_hint,
     standalone_order=emit_preamble,
   )
+  out += _gen_gpu_mem_include(gpu_mem_log or gpu_mem_log_detail)
   out += f"namespace {ruleset_name}_Plans {{\n"
   out += "}\n\n"
   if decl_only_runner:
     # Step/run bodies live in their own shards — keep main.cpp tiny.
-    out += gen_runner_struct_declonly(ruleset_name, decls, mir_program)
+    out += gen_runner_struct_declonly(
+      ruleset_name,
+      decls,
+      mir_program,
+      amplified_loader=amplified_loader,
+    )
   else:
     out += gen_runner_struct(
       ruleset_name,
@@ -567,6 +772,10 @@ def gen_main_file_content(
       mir_program,
       step_bodies,
       canonical_indices,
+      gpu_mem_log=gpu_mem_log,
+      gpu_mem_log_detail=gpu_mem_log_detail,
+      amplified_loader=amplified_loader,
+      ensure_print_indexes=ensure_print_indexes,
     )
   if jit_batch_count > 0:
     out += "\n// ======== JIT File-Based Compilation ========\n"
@@ -584,6 +793,10 @@ def gen_unity_main_file_content(
   *,
   canonical_indices: dict[str, list[int]] | None = None,
   extra_index_headers: list[str] | None = None,
+  gpu_mem_log: bool = False,
+  gpu_mem_log_detail: bool = False,
+  amplified_loader: bool = False,
+  ensure_print_indexes: bool = False,
 ) -> str:
   '''Emit ONE large .cpp that contains everything a project needs —
   preamble, schemas, DB alias, every JitRunner_X struct body, the
@@ -612,6 +825,9 @@ def gen_unity_main_file_content(
   out += '#include "gpu/runtime/gpu_mir_helpers.h"\n'
   out += '#include "gpu/runtime/stream_pool.h"\n'
   out += '#include "gpu/init.h"  // SRDatalog::GPU::init_cuda\n\n'
+  out += _gen_gpu_mem_include(gpu_mem_log or gpu_mem_log_detail)
+  if gpu_mem_log or gpu_mem_log_detail:
+    out += "\n"
   out += 'using SRDatalog::GPU::JIT::intersect_handles;\n'
   out += 'using namespace SRDatalog::GPU;\n\n'
   # Plugin index headers (Device2LevelIndex, DeviceTvjoinIndex, ...).
@@ -649,6 +865,10 @@ def gen_unity_main_file_content(
     mir_program,
     step_bodies,
     canonical_indices,
+    gpu_mem_log=gpu_mem_log,
+    gpu_mem_log_detail=gpu_mem_log_detail,
+    amplified_loader=amplified_loader,
+    ensure_print_indexes=ensure_print_indexes,
   )
   return out
 
@@ -656,6 +876,9 @@ def gen_unity_main_file_content(
 def gen_extern_c_shim(
   ruleset_name: str,
   decls: list[RelationDecl],
+  gpu_mem_log: bool = False,
+  amplified_loader: bool = False,
+  canonical_indices: dict[str, list[int]] | None = None,
 ) -> str:
   '''Emit an `extern "C"` shim the Python ctypes loader can call.
 
@@ -663,22 +886,31 @@ def gen_extern_c_shim(
     - `srdatalog_init()`                     — init CUDA
     - `srdatalog_load_csv(rel, path)`        — load_from_file for one relation
     - `srdatalog_run(max_iters)`             — copy-to-device + _Runner::run
-    - `srdatalog_shutdown()`                 — free host DB
-    - `srdatalog_size(rel_name)`             — FULL_VER canonical index size
+    - `srdatalog_shutdown()`                 — free device DB, then host DB
+    - `srdatalog_size(rel_name)`             — device FULL_VER canonical index size
 
-  The shim uses a file-scope `HostDB*` holding the live SemiNaiveDatabase
-  so Python can stage data via multiple `load_csv` calls before `run`.
+  The shim keeps the device DB alive after `run` so Python can query derived
+  GPU relation sizes before shutdown.
   '''
   ext_db = f"{ruleset_name}_DB"
   blueprint = f"{ext_db}_Blueprint"
   host_db = f"{blueprint}_HostDB"
+  device_db = f"{blueprint}_DeviceDB"
+  canonical = canonical_indices or {}
 
-  out = [
+  out = []
+  if gpu_mem_log:
+    out.append(_gen_gpu_mem_include(True).rstrip())
+  out += [
     "// ======== Python ctypes shim (extern \"C\") ========",
+    "#include <memory>",
     '#include "gpu/init.h"  // SRDatalog::GPU::init_cuda',
     "",
     f"using {host_db} = SRDatalog::AST::SemiNaiveDatabase<{blueprint}>;",
+    f"using {device_db} = SRDatalog::AST::SemiNaiveDatabase"
+    f"<{blueprint}, SRDatalog::GPU::DeviceRelationType>;",
     f"static {host_db}* g_host_db = nullptr;",
+    f"static std::unique_ptr<{device_db}> g_device_db;",
     "",
     'extern "C" {',
     "",
@@ -694,6 +926,7 @@ def gen_extern_c_shim(
     "  if (!rel_name || !path) return 1;",
     f"  if (!g_host_db) g_host_db = new {host_db}();",
     "  try {",
+    "    g_device_db.reset();",
     "    std::string rn(rel_name);",
   ]
   # Only emit load_from_file dispatch for relations marked with
@@ -706,8 +939,10 @@ def gen_extern_c_shim(
   for d in loadable:
     kw = "if" if first else "else if"
     first = False
+    loader = "load_from_file_env_amplified" if amplified_loader else "load_from_file"
     out.append(
-      f'    {kw} (rn == "{d.rel_name}") SRDatalog::load_from_file<{d.rel_name}>(*g_host_db, path);'
+      f'    {kw} (rn == "{d.rel_name}") '
+      f"SRDatalog::{loader}<{d.rel_name}>(*g_host_db, path);"
     )
   if loadable:
     out.append(
@@ -732,7 +967,16 @@ def gen_extern_c_shim(
     "  if (!data_dir) return 1;",
     f"  if (!g_host_db) g_host_db = new {host_db}();",
     "  try {",
+    "    g_device_db.reset();",
+  ]
+  if gpu_mem_log:
+    out.append('    SRDatalog::GPU::log_gpu_memory("before load_all");')
+  out += [
     f"    {ruleset_name}_Runner::load_data(*g_host_db, std::string(data_dir));",
+  ]
+  if gpu_mem_log:
+    out.append('    SRDatalog::GPU::log_gpu_memory("after load_all");')
+  out += [
     "    return 0;",
     "  } catch (const std::exception& e) {",
     '    std::cerr << "srdatalog_load_all: " << e.what() << std::endl;',
@@ -743,26 +987,46 @@ def gen_extern_c_shim(
     "int srdatalog_run(unsigned long long max_iters) {",
     "  if (!g_host_db) return 1;",
     "  try {",
+  ]
+  if gpu_mem_log:
+    out.append('    SRDatalog::GPU::log_gpu_memory("before copy_host_to_device");')
+  out += [
+    "    g_device_db.reset();",
     "    auto device_db = SRDatalog::GPU::copy_host_to_device(*g_host_db);",
-    f"    {ruleset_name}_Runner::run(device_db, max_iters ? (std::size_t)max_iters : std::numeric_limits<int>::max());",
+    f"    g_device_db = std::make_unique<{device_db}>(std::move(device_db));",
+  ]
+  if gpu_mem_log:
+    out.append('    SRDatalog::GPU::log_gpu_memory("after copy_host_to_device");')
+    out.append('    SRDatalog::GPU::log_gpu_memory("before run");')
+  out += [
+    f"    {ruleset_name}_Runner::run(*g_device_db, max_iters ? (std::size_t)max_iters : std::numeric_limits<int>::max());",
+  ]
+  if gpu_mem_log:
+    out.append('    SRDatalog::GPU::log_gpu_memory("after run");')
+  out += [
     "    return 0;",
     "  } catch (const std::exception& e) {",
+  ]
+  if gpu_mem_log:
+    out.append('    SRDatalog::GPU::log_gpu_memory("run exception");')
+  out += [
     '    std::cerr << "srdatalog_run: " << e.what() << std::endl;',
     "    return 2;",
     "  }",
     "}",
     "",
     "unsigned long long srdatalog_size(const char* rel_name) {",
-    "  if (!g_host_db || !rel_name) return 0;",
+    "  if (!g_device_db || !rel_name) return 0;",
     "  std::string rn(rel_name);",
   ]
   for d in decls:
-    cols = ", ".join(str(i) for i in range(len(d.types)))
+    cols = ", ".join(str(i) for i in canonical.get(d.rel_name, list(range(len(d.types)))))
     out.append(f'  if (rn == "{d.rel_name}") {{')
-    out.append(f'    auto& rel = get_relation_by_schema<{d.rel_name}, FULL_VER>(*g_host_db);')
+    out.append(f'    auto& rel = get_relation_by_schema<{d.rel_name}, FULL_VER>(*g_device_db);')
     out.append(f'    SRDatalog::IndexSpec idx{{{cols}}};')
+    out.append("    if (!rel.has_index(idx)) rel.ensure_index(idx);")
     out.append(
-      '    return rel.has_index(idx) ? (unsigned long long)rel.get_index(idx).root().degree() : 0ULL;'
+      '    return rel.has_index(idx) ? (unsigned long long)rel.get_index(idx).root().degree() : (unsigned long long)rel.size();'
     )
     out.append('  }')
   out += [
@@ -770,8 +1034,14 @@ def gen_extern_c_shim(
     "}",
     "",
     "int srdatalog_shutdown() {",
-    "  if (g_host_db) { delete g_host_db; g_host_db = nullptr; }",
-    "  return 0;",
+    "  try {",
+    "    g_device_db.reset();",
+    "    if (g_host_db) { delete g_host_db; g_host_db = nullptr; }",
+    "    return 0;",
+    "  } catch (const std::exception& e) {",
+    '    std::cerr << "srdatalog_shutdown: " << e.what() << std::endl;',
+    "    return 1;",
+    "  }",
     "}",
     "",
     "}  // extern \"C\"",

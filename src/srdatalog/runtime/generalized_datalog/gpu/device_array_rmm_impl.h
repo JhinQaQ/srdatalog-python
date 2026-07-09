@@ -27,6 +27,7 @@
 // We need the full RMM headers here for pool_memory_resource and cuda_memory_resource types
 // Note: hipMM maintains RMM API compatibility, so these headers work for both CUDA and HIP
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -35,10 +36,27 @@
 #include <rmm/mr/device/cuda_memory_resource.hpp>  // hipMM maintains this API
 #include <rmm/mr/device/per_device_resource.hpp>
 #include <rmm/mr/device/pool_memory_resource.hpp>
+#include <rmm/mr/device/statistics_resource_adaptor.hpp>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace SRDatalog::GPU {
+
+inline bool rmm_env_flag_enabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return false;
+  }
+  return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+         std::strcmp(value, "FALSE") != 0 && std::strcmp(value, "off") != 0 &&
+         std::strcmp(value, "OFF") != 0;
+}
+
+inline bool rmm_stats_log_enabled() {
+  return rmm_env_flag_enabled("SRDATALOG_RMM_STATS_LOG") ||
+         rmm_env_flag_enabled("SRDATALOG_GPU_MEM_LOG");
+}
 
 /**
  * @brief Configuration for RMM pool memory resource
@@ -93,6 +111,55 @@ inline std::optional<std::size_t> get_max_size_optional() {
 }
 }  // namespace RMMConfig
 
+using SRDatalogRMMUpstream = rmm::mr::cuda_memory_resource;
+using SRDatalogRMMPool = rmm::mr::pool_memory_resource<SRDatalogRMMUpstream>;
+using SRDatalogRMMStats = rmm::mr::statistics_resource_adaptor<SRDatalogRMMPool>;
+
+struct RMMResourceBundle {
+  std::unique_ptr<SRDatalogRMMUpstream> upstream;
+  std::unique_ptr<SRDatalogRMMPool> pool;
+  std::unique_ptr<SRDatalogRMMStats> stats;
+
+  [[nodiscard]] rmm::mr::device_memory_resource* current_resource() const {
+    if (stats) {
+      return stats.get();
+    }
+    return pool.get();
+  }
+};
+
+inline RMMResourceBundle& get_gpu_rmm_resource_bundle() {
+  static RMMResourceBundle bundle = []() {
+    // Ensure GPU is initialized before accessing RMM/hipMM
+    int current_device = -1;
+    GPU_ERROR_T err = GPU_GET_DEVICE(&current_device);
+    if (err != GPU_SUCCESS) {
+      throw std::runtime_error(
+          "get_gpu_rmm_resource_bundle: GPU not initialized. Call init_cuda() first. Error: " +
+          std::string(GPU_GET_ERROR_STRING(err)));
+    }
+
+    auto upstream = std::make_unique<SRDatalogRMMUpstream>();
+
+    // Get configured pool sizes (from environment variables or defaults)
+    std::size_t initial_size = RMMConfig::get_initial_size();
+    std::optional<std::size_t> max_size = RMMConfig::get_max_size_optional();
+
+    // If max_size is nullopt, RMM lets the pool grow up to available device memory.
+    auto pool = std::make_unique<SRDatalogRMMPool>(upstream.get(), initial_size, max_size);
+
+    std::unique_ptr<SRDatalogRMMStats> stats;
+    if (rmm_stats_log_enabled()) {
+      stats = std::make_unique<SRDatalogRMMStats>(pool.get());
+    }
+
+    RMMResourceBundle result{std::move(upstream), std::move(pool), std::move(stats)};
+    rmm::mr::set_current_device_resource(result.current_resource());
+    return result;
+  }();
+  return bundle;
+}
+
 /**
  * @brief Thread-safe singleton that provides a global GPU pool memory resource
  * @note GPU (CUDA or HIP) must be initialized before this is called (call init_cuda() first)
@@ -100,40 +167,38 @@ inline std::optional<std::size_t> get_max_size_optional() {
  * @note The pool is also set as the global per-device resource so all RMM/hipMM allocations use it
  */
 inline rmm::mr::device_memory_resource* get_gpu_pool_memory_resource() {
-  static std::unique_ptr<rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>> pool = []() {
-    // Ensure GPU is initialized before accessing RMM/hipMM
-    int current_device = -1;
-    GPU_ERROR_T err = GPU_GET_DEVICE(&current_device);
-    if (err != GPU_SUCCESS) {
-      throw std::runtime_error(
-          "get_gpu_pool_memory_resource: GPU not initialized. Call init_cuda() first. Error: " +
-          std::string(GPU_GET_ERROR_STRING(err)));
-    }
+  return get_gpu_rmm_resource_bundle().pool.get();
+}
 
-    // Create GPU memory resource as upstream (works with both CUDA and HIP via hipMM)
-    // Note: pool_memory_resource takes ownership via raw pointer, so we use new
-    // and manage the lifetime through the pool itself
-    // hipMM maintains RMM API compatibility, so cuda_memory_resource works for both
-    auto cuda_mr = new rmm::mr::cuda_memory_resource();
+/**
+ * @brief Current device memory resource to install in RMM.
+ * @details When SRDATALOG_GPU_MEM_LOG or SRDATALOG_RMM_STATS_LOG is enabled before
+ *          init_cuda(), this is an RMM statistics adaptor around the pool. Otherwise
+ *          it is the pool itself.
+ */
+inline rmm::mr::device_memory_resource* get_gpu_current_memory_resource() {
+  return get_gpu_rmm_resource_bundle().current_resource();
+}
 
-    // Get configured pool sizes (from environment variables or defaults)
-    std::size_t initial_size = RMMConfig::get_initial_size();
-    std::optional<std::size_t> max_size = RMMConfig::get_max_size_optional();
-
-    // Create pool memory resource with configurable sizes
-    // Pass std::nullopt for max_size to indicate unlimited (no max size limit)
-    // If max_size is nullopt, RMM will allow the pool to grow without limit (up to GPU memory)
-    auto pool_ptr = std::make_unique<rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>>(
-        cuda_mr, initial_size, max_size);
-
-    // Set as the current device's memory resource so all RMM allocations use this pool
-    // This ensures device_uvector, rmm::device_vector, and other RMM containers
-    // all use the same pool, and Thrust temporary allocations (via rmm::exec_policy) can use it too
-    rmm::mr::set_current_device_resource(pool_ptr.get());
-
-    return pool_ptr;
-  }();
-  return pool.get();
+inline RMMMemoryStats get_rmm_memory_stats() {
+  auto& bundle = get_gpu_rmm_resource_bundle();
+  RMMMemoryStats out{};
+  if (bundle.pool) {
+    out.pool_available = true;
+    out.pool_size_bytes = bundle.pool->pool_size();
+  }
+  if (bundle.stats) {
+    out.stats_enabled = true;
+    auto bytes = bundle.stats->get_bytes_counter();
+    auto allocations = bundle.stats->get_allocations_counter();
+    out.current_bytes = static_cast<std::size_t>(bytes.value);
+    out.peak_bytes = static_cast<std::size_t>(bytes.peak);
+    out.total_bytes = static_cast<std::size_t>(bytes.total);
+    out.current_allocations = static_cast<std::size_t>(allocations.value);
+    out.peak_allocations = static_cast<std::size_t>(allocations.peak);
+    out.total_allocations = static_cast<std::size_t>(allocations.total);
+  }
+  return out;
 }
 
 /**
@@ -153,17 +218,7 @@ inline void init_rmm_pool() {
  */
 inline rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>*
 get_gpu_pool_memory_resource_typed() {
-  // The pool is stored internally, so we need to get it via the singleton
-  // Since get_gpu_pool_memory_resource() returns device_memory_resource*,
-  // we need to access the internal static pool directly
-  // We'll use a function-local static to cache the typed pointer
-  static rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>* typed_pool = []() {
-    // Cast the returned pointer to the concrete type
-    // This is safe because we know it's a pool_memory_resource from get_gpu_pool_memory_resource()
-    return static_cast<rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>*>(
-        get_gpu_pool_memory_resource());
-  }();
-  return typed_pool;
+  return get_gpu_rmm_resource_bundle().pool.get();
 }
 
 /**

@@ -15,6 +15,7 @@ Mapping to Nim:
   moInsertInto           -> InsertInto
   moExecutePipeline      -> ExecutePipeline
   moRebuildIndex         -> RebuildIndex
+  moEvictIndex           -> EvictIndex (Python extension for experiments)
   moClearRelation        -> ClearRelation
   moCheckSize            -> CheckSize
   moComputeDelta         -> ComputeDelta
@@ -222,6 +223,15 @@ class RebuildIndex:
 
 
 @dataclass
+class EvictIndex:
+  '''(evict-index #:index (R cols...) #:ver V)'''
+
+  rel_name: str
+  version: Version
+  index: list[int]
+
+
+@dataclass
 class ClearRelation:
   '''(clear-relation :schema R :ver V)'''
 
@@ -406,6 +416,7 @@ MirNode = Union[
   GatherColumn,
   InsertInto,
   RebuildIndex,
+  EvictIndex,
   ClearRelation,
   CheckSize,
   ComputeDelta,

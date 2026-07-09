@@ -327,14 +327,136 @@ def apply_balanced_scan_pass(
 
 
 # -----------------------------------------------------------------------------
+# Pass 4: insert_dead_index_evictions
+# -----------------------------------------------------------------------------
+
+
+FullIndexKey = tuple[str, tuple[int, ...]]
+
+
+def _record_full_index_use(out: set[FullIndexKey], rel_name: str, version: Version, index: list[int]) -> None:
+  if version is Version.FULL:
+    out.add((rel_name, tuple(index)))
+  elif version is Version.DELTA:
+    # The CUDA codegen creates/touches the matching FULL index for DELTA
+    # sources, so future DELTA reads keep the FULL layout alive.
+    out.add((rel_name, tuple(index)))
+
+
+def _collect_full_index_uses(node: mir.MirNode, out: set[FullIndexKey]) -> None:
+  if isinstance(node, (mir.ColumnSource, mir.Scan, mir.Negation, mir.Aggregate)):
+    _record_full_index_use(out, node.rel_name, node.version, node.index)
+    return
+  if isinstance(node, mir.ColumnJoin):
+    for source in node.sources:
+      _collect_full_index_uses(source, out)
+    return
+  if isinstance(node, mir.CartesianJoin):
+    for source in node.sources:
+      _collect_full_index_uses(source, out)
+    return
+  if isinstance(node, mir.BalancedScan):
+    _collect_full_index_uses(node.source1, out)
+    _collect_full_index_uses(node.source2, out)
+    return
+  if isinstance(node, mir.PositionedExtract):
+    for source in node.sources:
+      _collect_full_index_uses(source, out)
+    return
+  if isinstance(node, mir.ExecutePipeline):
+    for op in node.pipeline:
+      _collect_full_index_uses(op, out)
+    return
+  if isinstance(node, mir.ParallelGroup):
+    for op in node.ops:
+      _collect_full_index_uses(op, out)
+    return
+  if isinstance(node, mir.Block):
+    for instr in node.instructions:
+      _collect_full_index_uses(instr, out)
+    return
+  if isinstance(node, mir.FixpointPlan):
+    for instr in node.instructions:
+      _collect_full_index_uses(instr, out)
+    return
+  if isinstance(node, mir.RebuildIndex):
+    if node.version is Version.FULL:
+      out.add((node.rel_name, tuple(node.index)))
+    return
+  if isinstance(node, mir.RebuildIndexFromIndex):
+    if node.version is Version.FULL:
+      out.add((node.rel_name, tuple(node.source_index)))
+      out.add((node.rel_name, tuple(node.target_index)))
+    return
+  if isinstance(node, mir.ComputeDelta):
+    if node.index:
+      out.add((node.rel_name, tuple(node.index)))
+    return
+  if isinstance(node, mir.ComputeDeltaIndex):
+    out.add((node.rel_name, tuple(node.canonical_index)))
+    return
+  if isinstance(node, mir.MergeIndex):
+    out.add((node.rel_name, tuple(node.index)))
+    return
+  if isinstance(node, mir.PostStratumReconstructInternCols):
+    out.add((node.rel_name, tuple(node.canonical_index)))
+
+
+def _full_index_uses_for_step(node: mir.MirNode, protected_rels: set[str]) -> set[FullIndexKey]:
+  uses: set[FullIndexKey] = set()
+  _collect_full_index_uses(node, uses)
+  return {(rel, idx) for rel, idx in uses if rel not in protected_rels}
+
+
+def insert_dead_index_evictions(
+  steps: list[tuple[mir.MirNode, bool]],
+  *,
+  protected_rels: set[str] | None = None,
+) -> list[tuple[mir.MirNode, bool]]:
+  '''Insert top-level FULL-index evictions after each index's last use.
+
+  This is intentionally conservative: evictions are separate top-level steps,
+  and only FULL layouts are dropped. DELTA uses still keep the matching FULL
+  layout live because the CUDA codegen may create/touch it for DELTA sources.
+  '''
+
+  protected = protected_rels or set()
+  step_uses = [_full_index_uses_for_step(node, protected) for node, _ in steps]
+  last_use: dict[FullIndexKey, int] = {}
+  for i, uses in enumerate(step_uses):
+    for use in uses:
+      last_use[use] = i
+
+  out: list[tuple[mir.MirNode, bool]] = []
+  for i, (node, is_rec) in enumerate(steps):
+    out.append((node, is_rec))
+    dead_after_step = [use for use in step_uses[i] if last_use.get(use) == i]
+    for rel_name, index in sorted(dead_after_step):
+      out.append(
+        (
+          mir.EvictIndex(rel_name=rel_name, version=Version.FULL, index=list(index)),
+          False,
+        )
+      )
+  return out
+
+
+# -----------------------------------------------------------------------------
 # Chain
 # -----------------------------------------------------------------------------
 
 
-def apply_all_mir_passes(steps: list[tuple[mir.MirNode, bool]]) -> list[tuple[mir.MirNode, bool]]:
+def apply_all_mir_passes(
+  steps: list[tuple[mir.MirNode, bool]],
+  *,
+  evict_dead_indexes: bool = False,
+  protected_rels: set[str] | None = None,
+) -> list[tuple[mir.MirNode, bool]]:
   '''Run the ported MIR optimization passes in Nim order.'''
   steps = insert_pre_reconstruct_rebuilds(steps)
   steps = apply_clause_order_reordering(steps)
   steps = apply_prefix_source_reordering(steps)
   steps = apply_balanced_scan_pass(steps)
+  if evict_dead_indexes:
+    steps = insert_dead_index_evictions(steps, protected_rels=protected_rels)
   return steps

@@ -47,6 +47,9 @@ def build_project(
   emit_main_file: bool = True,
   shard_step_bodies: bool = False,
   unity: bool = False,
+  gpu_mem_log: bool = False,
+  gpu_mem_log_detail: bool = False,
+  evict_dead_indexes: bool = False,
 ) -> JitProjectLayout:
   '''Compile `program` end-to-end and write the .cpp tree.
 
@@ -75,11 +78,17 @@ def build_project(
       compile from ~100s to ~20s. Set False for the traditional
       main + batch layout (better for byte-match testing against the
       Nim reference or for partial recompiles once PCH works).
+    gpu_mem_log: if True, emit CUDA memory checkpoints controlled at
+      runtime by `SRDATALOG_GPU_MEM_LOG=1`.
+    gpu_mem_log_detail: if True, emit additional checkpoints inside
+      generated step bodies, controlled by `SRDATALOG_GPU_MEM_LOG_DETAIL=1`.
+    evict_dead_indexes: if True, insert experimental top-level FULL-index
+      eviction steps after the compiler's last known use of each layout.
 
   Returns the dict from `cache.write_jit_project`:
     { "dir", "main", "batches": [...], "schema_header", "kernel_header" }
   '''
-  cr = compile_program(program, project_name)
+  cr = compile_program(program, project_name, evict_dead_indexes=evict_dead_indexes)
 
   main_cpp = ""
   if emit_main_file:
@@ -93,6 +102,10 @@ def build_project(
         cr.per_rule_runners,
         extra_index_headers=cr.extra_headers,
         canonical_indices=cr.canonical_indices,
+        gpu_mem_log=gpu_mem_log,
+        gpu_mem_log_detail=gpu_mem_log_detail,
+        amplified_loader=True,
+        ensure_print_indexes=evict_dead_indexes,
       )
     else:
       main_cpp = gen_main_file_content(
@@ -107,8 +120,18 @@ def build_project(
         extra_index_headers=cr.extra_headers,
         decl_only_runner=shard_step_bodies,
         canonical_indices=cr.canonical_indices,
+        gpu_mem_log=gpu_mem_log,
+        gpu_mem_log_detail=gpu_mem_log_detail,
+        amplified_loader=True,
+        ensure_print_indexes=evict_dead_indexes,
       )
-    main_cpp += "\n" + gen_extern_c_shim(project_name, cr.hir.relation_decls)
+    main_cpp += "\n" + gen_extern_c_shim(
+      project_name,
+      cr.hir.relation_decls,
+      gpu_mem_log=gpu_mem_log,
+      amplified_loader=True,
+      canonical_indices=cr.canonical_indices,
+    )
 
   # In unity mode we want no jit_batch_*.cpp files — they'd be
   # redundant (every JitRunner is already inlined in main.cpp).
@@ -137,6 +160,8 @@ def build_project(
         cr.step_bodies,
         i,
         extra_index_headers=cr.extra_headers,
+        amplified_loader=True,
+        gpu_mem_log_detail=gpu_mem_log_detail,
       )
       path = os.path.join(str(result["dir"]), f"step_body_{i}.cpp")
       with open(path, "w") as f:
@@ -148,7 +173,11 @@ def build_project(
       cr.hir.relation_decls,
       cr.runner_decls,
       cr.mir,
+      canonical_indices=cr.canonical_indices,
       extra_index_headers=cr.extra_headers,
+      gpu_mem_log=gpu_mem_log,
+      amplified_loader=True,
+      ensure_print_indexes=evict_dead_indexes,
     )
     path = os.path.join(str(result["dir"]), "runner_dispatcher.cpp")
     with open(path, "w") as f:

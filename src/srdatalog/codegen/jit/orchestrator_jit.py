@@ -480,6 +480,7 @@ def gen_instruction_code(
   iter_var: str,
   dest_stream_map: dict[str, list[int]],
   count_only_rels: set[str] | None = None,
+  step_num: int | None = None,
 ) -> str:
   '''Emit imperative C++ for one fixpoint-level MIR instruction.'''
   if count_only_rels is None:
@@ -547,6 +548,12 @@ def gen_instruction_code(
     ver = version_string(instr.version.code)
     spec_type = gen_index_spec_type(instr.rel_name, ver, list(instr.index))
     return indent + f"SRDatalog::GPU::mir_helpers::rebuild_index_fn<{spec_type}>(db);\n"
+
+  if isinstance(instr, m.EvictIndex):
+    ver = version_string(instr.version.code)
+    spec_type = gen_index_spec_type(instr.rel_name, ver, list(instr.index))
+    step_arg = "-1" if step_num is None else str(step_num)
+    return indent + f"SRDatalog::GPU::mir_helpers::evict_index_fn<{spec_type}>(db, {step_arg});\n"
 
   if isinstance(instr, m.RebuildIndexFromIndex):
     ver = version_string(instr.version.code)
@@ -749,6 +756,7 @@ def gen_non_recursive_block(
   db_type_name: str,
   indent: str,
   count_only_rels: set[str] | None = None,
+  step_num: int | None = None,
 ) -> str:
   '''Non-recursive path. Handles Block / FixpointPlan / ExecutePipeline /
   PostStratumReconstructInternCols.'''
@@ -779,6 +787,20 @@ def gen_non_recursive_block(
       "0",
       dest_stream_map,
       count_only_rels,
+      step_num,
+    )
+    out += i + "GPU_DEVICE_SYNCHRONIZE();\n"
+    return out
+
+  if isinstance(plan, m.EvictIndex):
+    out += i + "GPU_DEVICE_SYNCHRONIZE();\n"
+    out += gen_instruction_code(
+      plan,
+      i,
+      "0",
+      dest_stream_map,
+      count_only_rels,
+      step_num,
     )
     out += i + "GPU_DEVICE_SYNCHRONIZE();\n"
     return out
@@ -883,7 +905,7 @@ def gen_step_body(
     assert isinstance(plan, m.FixpointPlan), "recursive step must be a FixpointPlan"
     body += gen_fixpoint_body(plan, db_type_name, indent, count_only_rels)
   else:
-    body += gen_non_recursive_block(plan, db_type_name, indent, count_only_rels)
+    body += gen_non_recursive_block(plan, db_type_name, indent, count_only_rels, step_num)
 
   body += "  }\n"
   return body

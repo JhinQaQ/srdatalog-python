@@ -614,7 +614,9 @@ std::size_t DeviceSortedArrayIndex<SR, AttrTuple, ValueType, RowIdType>::bytes_u
   for (std::size_t i = 0; i < p_->index_arity; ++i) {
     b += p_->cols.num_rows() * sizeof(ValueType);
   }
-  b += p_->provenance.size() * sizeof(semiring_value_t<SR>);
+  if constexpr (has_provenance_v<SR>) {
+    b += p_->provenance.size() * sizeof(semiring_value_t<SR>);
+  }
   b += p_->root_unique_values.size() * sizeof(ValueType);
   return b;
 }

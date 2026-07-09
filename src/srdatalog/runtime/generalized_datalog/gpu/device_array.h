@@ -45,6 +45,18 @@
 
 namespace SRDatalog::GPU {
 
+struct RMMMemoryStats {
+  bool stats_enabled{false};
+  bool pool_available{false};
+  std::size_t current_bytes{0};
+  std::size_t peak_bytes{0};
+  std::size_t total_bytes{0};
+  std::size_t current_allocations{0};
+  std::size_t peak_allocations{0};
+  std::size_t total_allocations{0};
+  std::size_t pool_size_bytes{0};
+};
+
 /**
  * @brief Thread-safe singleton that provides a global GPU pool memory resource
  * @note GPU (CUDA or HIP) must be initialized before this is called (call init_cuda() first)
@@ -52,6 +64,18 @@ namespace SRDatalog::GPU {
  * @note Implementation is in device_array_rmm_impl.h (included below for host code)
  */
 __host__ rmm::mr::device_memory_resource* get_gpu_pool_memory_resource();
+
+/**
+ * @brief Resource that should be installed as RMM's current device resource.
+ * @details Returns an allocator statistics adaptor when memory logging is enabled,
+ *          otherwise returns the raw pool resource.
+ */
+__host__ rmm::mr::device_memory_resource* get_gpu_current_memory_resource();
+
+/**
+ * @brief Snapshot RMM allocator stats for GPU memory logs.
+ */
+__host__ RMMMemoryStats get_rmm_memory_stats();
 
 /**
  * @brief Print RMM pool memory usage report

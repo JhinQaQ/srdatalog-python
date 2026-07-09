@@ -57,6 +57,8 @@ def compile_to_mir(
   program: Program,
   verbose: bool = False,
   apply_mir_passes: bool = True,
+  evict_dead_indexes: bool = False,
+  protected_rels: set[str] | None = None,
 ):
   '''End-to-end: Program -> HIR -> MIR. Returns a mir_types.Program.
 
@@ -72,5 +74,9 @@ def compile_to_mir(
   if apply_mir_passes:
     from srdatalog.mir.passes import apply_all_mir_passes
 
-    steps = apply_all_mir_passes(steps)
+    steps = apply_all_mir_passes(
+      steps,
+      evict_dead_indexes=evict_dead_indexes,
+      protected_rels=protected_rels,
+    )
   return mir.Program(steps=[(node, is_rec) for node, is_rec in steps])

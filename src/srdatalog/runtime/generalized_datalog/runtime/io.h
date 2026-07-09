@@ -20,6 +20,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <unordered_set>
 #include <unistd.h>
 #include <vector>
 
@@ -81,6 +82,78 @@ inline DelimiterInfo detect_delimiter(std::ifstream& file, std::string& first_li
 }
 
 namespace detail {
+
+struct AmplifyOptions {
+  std::size_t copies = 1;
+  std::uint64_t stride = 0;
+  std::unordered_set<std::uint64_t> stable_values;
+
+  [[nodiscard]] bool enabled() const noexcept {
+    return copies > 1 && stride > 0;
+  }
+};
+
+inline std::uint64_t parse_uint_env(const char* value, std::uint64_t fallback) {
+  if (value == nullptr || *value == '\0') {
+    return fallback;
+  }
+  char* end = nullptr;
+  auto parsed = std::strtoull(value, &end, 10);
+  return end == value ? fallback : parsed;
+}
+
+inline AmplifyOptions amplify_options_from_env() {
+  AmplifyOptions opts;
+  opts.copies = static_cast<std::size_t>(
+      parse_uint_env(std::getenv("SRDATALOG_AMPLIFY_COPIES"), opts.copies));
+  opts.stride = parse_uint_env(std::getenv("SRDATALOG_AMPLIFY_STRIDE"), opts.stride);
+
+  const char* stable = std::getenv("SRDATALOG_AMPLIFY_STABLE_IDS");
+  if (stable != nullptr) {
+    std::stringstream ss(stable);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      if (!item.empty()) {
+        opts.stable_values.insert(parse_uint_env(item.c_str(), 0));
+      }
+    }
+  }
+  return opts;
+}
+
+template <typename T>
+T amplify_value(T value, std::size_t copy_idx, const AmplifyOptions& opts) {
+  if constexpr (std::is_integral_v<T>) {
+    if (copy_idx == 0) {
+      return value;
+    }
+    auto as_u64 = static_cast<std::uint64_t>(value);
+    if (opts.stable_values.contains(as_u64)) {
+      return value;
+    }
+    return static_cast<T>(as_u64 + (copy_idx * opts.stride));
+  } else {
+    return value;
+  }
+}
+
+template <typename Relation, typename AttrTuple>
+void push_amplified_row(Relation& rel, const AttrTuple& row, std::size_t copy_idx,
+                        const AmplifyOptions& opts) {
+  static constexpr size_t Arity = Relation::arity;
+  if constexpr (has_provenance_v<typename Relation::semiring_type>) {
+    rel.provenance().push_back(Relation::semiring_type::one());
+  }
+  [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+    (([&]() {
+       auto value = amplify_value(std::get<Is>(row), copy_idx, opts);
+       rel.template column<Is>().push_back(value);
+       using ValType = typename Relation::value_type;
+       rel.template interned_column<Is>().push_back(static_cast<ValType>(encode_to_size_t(value)));
+     }()),
+     ...);
+  }(std::make_index_sequence<Arity>{});
+}
 
 // Fast integer parser
 template <typename T>
@@ -378,6 +451,174 @@ void fast_load_file_impl(Relation& rel, const std::string& filename) {
   close(fd);
 }
 
+template <typename AttrTuple, typename Relation>
+void fast_load_file_amplified_impl(Relation& rel, const std::string& filename,
+                                   const AmplifyOptions& opts) {
+  int fd = open(filename.c_str(), O_RDONLY);
+  if (fd == -1)
+    throw std::runtime_error("Could not open file: " + filename);
+
+  struct stat sb;
+  if (fstat(fd, &sb) == -1) {
+    close(fd);
+    throw std::runtime_error("Could not stat: " + filename);
+  }
+
+  size_t file_size = sb.st_size;
+  if (file_size == 0) {
+    close(fd);
+    return;
+  }
+
+  char* mapped = (char*)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (mapped == MAP_FAILED) {
+    close(fd);
+    throw std::runtime_error("Could not mmap: " + filename);
+  }
+
+  madvise(mapped, file_size, MADV_SEQUENTIAL);
+
+  const char* p = mapped;
+  const char* end = mapped + file_size;
+
+  DelimiterInfo delim_info;
+  const char* line_end = p;
+  while (line_end < end && *line_end != '\n')
+    line_end++;
+
+  size_t tabs = 0, commas = 0, max_spaces = 0, curr_spaces = 0;
+  for (const char* c = p; c < line_end; c++) {
+    if (*c == '\t')
+      tabs++;
+    if (*c == ',')
+      commas++;
+    if (*c == ' ') {
+      curr_spaces++;
+      if (curr_spaces > max_spaces)
+        max_spaces = curr_spaces;
+    } else {
+      curr_spaces = 0;
+    }
+  }
+
+  if (tabs > 0) {
+    delim_info.single_char = '\t';
+  } else if (commas > 0) {
+    delim_info.single_char = ',';
+  } else if (max_spaces >= 2) {
+    delim_info.is_multi_space = true;
+    delim_info.min_spaces = max_spaces;
+  } else {
+    delim_info.single_char = ' ';
+  }
+
+  size_t est_rows = (file_size / 20) * opts.copies;
+  static constexpr size_t Arity = Relation::arity;
+
+  [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+    ((rel.template column<Is>().reserve(est_rows)), ...);
+    ((rel.template interned_column<Is>().reserve(est_rows)), ...);
+  }(std::make_index_sequence<Arity>{});
+  if constexpr (has_provenance_v<typename Relation::semiring_type>) {
+    rel.provenance().reserve(est_rows);
+  }
+
+  while (p < end) {
+    while (p < end && (*p == '\n' || *p == '\r'))
+      p++;
+    if (p >= end)
+      break;
+
+    bool row_error = false;
+    AttrTuple row{};
+
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+      (([&]() {
+         if (row_error)
+           return;
+
+         using ColType = typename std::tuple_element<Is, AttrTuple>::type;
+         ColType val;
+
+         while (p < end && (*p == ' ' || *p == '\t') && !delim_info.is_multi_space &&
+                delim_info.single_char != ' ' && delim_info.single_char != '\t')
+           p++;
+
+         if constexpr (std::is_integral_v<ColType>) {
+           p = parse_int(p, end, val);
+         } else if constexpr (std::is_floating_point_v<ColType>) {
+           char buf[64];
+           size_t i = 0;
+           while (p < end && i < 63 &&
+                  (*p == '.' || *p == '-' || *p == '+' || *p == 'e' || *p == 'E' ||
+                   (*p >= '0' && *p <= '9'))) {
+             buf[i++] = *p++;
+           }
+           buf[i] = '\0';
+#if __cpp_lib_to_chars >= 201611L
+           std::from_chars(buf, buf + i, val);
+#else
+           val = static_cast<ColType>(std::strtod(buf, nullptr));
+#endif
+         } else {
+           const char* sep;
+           if (delim_info.is_multi_space) {
+             sep = p;
+             while (sep < end && *sep != '\n' && *sep != '\r') {
+               if (*sep == ' ') {
+                 size_t cnt = 0;
+                 const char* s = sep;
+                 while (s < end && *s == ' ') {
+                   cnt++;
+                   s++;
+                 }
+                 if (cnt >= delim_info.min_spaces)
+                   break;
+               }
+               sep++;
+             }
+           } else {
+             sep = p;
+             while (sep < end && *sep != delim_info.single_char && *sep != '\n' && *sep != '\r')
+               sep++;
+           }
+
+           const char* val_end = sep;
+           while (val_end > p && (*(val_end - 1) == ' ' || *(val_end - 1) == '\t'))
+             val_end--;
+           val = std::string(p, val_end - p);
+           p = sep;
+         }
+
+         if (delim_info.is_multi_space) {
+           while (p < end && *p == ' ')
+             p++;
+         } else {
+           if (p < end && *p == delim_info.single_char)
+             p++;
+         }
+
+         std::get<Is>(row) = std::move(val);
+       }()),
+       ...);
+    }(std::make_index_sequence<Arity>{});
+
+    if (!row_error) {
+      for (std::size_t copy_idx = 0; copy_idx < opts.copies; copy_idx++) {
+        push_amplified_row(rel, row, copy_idx, opts);
+      }
+    }
+
+    while (p < end && *p != '\n')
+      p++;
+    if (p < end)
+      p++;
+  }
+
+  munmap(mapped, file_size);
+  close(fd);
+}
+
 }  // namespace detail
 
 template <CRelationSchema Schema, typename DB>
@@ -391,6 +632,20 @@ void load_from_file(DB& runtime_db, const std::string& file_path) {
   detail::fast_load_file_impl<AttrTuple>(rel, file_path);
 
   // Build all indexes after loading is complete
+  rel.build_all_indexes();
+}
+
+template <CRelationSchema Schema, typename DB>
+void load_from_file_env_amplified(DB& runtime_db, const std::string& file_path) {
+  auto opts = detail::amplify_options_from_env();
+  if (!opts.enabled()) {
+    load_from_file<Schema>(runtime_db, file_path);
+    return;
+  }
+
+  using AttrTuple = typename Schema::attr_ts_type;
+  auto& rel = get_relation_by_schema<Schema, FULL_VER>(runtime_db);
+  detail::fast_load_file_amplified_impl<AttrTuple>(rel, file_path, opts);
   rel.build_all_indexes();
 }
 

@@ -31,6 +31,7 @@ void init_rmm_pool();
 #ifndef __CUDA_ARCH__
 #ifndef __HIP_DEVICE_COMPILE__
 rmm::mr::device_memory_resource* get_gpu_pool_memory_resource();
+rmm::mr::device_memory_resource* get_gpu_current_memory_resource();
 #endif
 #endif
 }  // namespace SRDatalog::GPU
@@ -94,12 +95,12 @@ inline void init_cuda(int device_id = 0) {
     // Only set RMM resource when compiling host code (not device code)
     // Note: __HIP__ is defined when compiling with -x hip, but we still want to execute this
     // The key is that __HIP_DEVICE_COMPILE__ is only set inside device functions
-    auto* pool = get_gpu_pool_memory_resource();
-    rmm::mr::set_current_device_resource(pool);
+    auto* resource = get_gpu_current_memory_resource();
+    rmm::mr::set_current_device_resource(resource);
 #elif !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     // For HIP host code compilation (__HIP__ defined but not __HIP_DEVICE_COMPILE__)
-    auto* pool = get_gpu_pool_memory_resource();
-    rmm::mr::set_current_device_resource(pool);
+    auto* resource = get_gpu_current_memory_resource();
+    rmm::mr::set_current_device_resource(resource);
 #endif
   });
 }
